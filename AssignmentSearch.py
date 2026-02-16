@@ -1,0 +1,1134 @@
+#!/usr/bin/env python3
+"""
+AssignmentSearch.py
+
+Modes:
+- bypatentnumber: input patent numbers or a .txt file
+- byassignee: input assignee names or a .txt file (via PatentsView)
+
+Pipeline:
+Assignee → PatentsView → Patent Numbers → USPTO ODP → Assignment CSV
+"""
+
+import argparse
+import os
+import difflib
+import requests
+import pandas as pd
+import sys
+import re
+import json
+import time
+from typing import List, Tuple, Optional, Any, Dict
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+import urllib.parse
+
+from dotenv import load_dotenv
+# Load variables from .env file
+load_dotenv()
+
+USPTO_API_KEY = os.getenv("USPTO_API_KEY")  # DO NOT hardcode
+PATENTSVIEW_API_KEY = os.getenv("PATENTSVIEW_API_KEY")  # Set PATENTSVIEW_API_KEY for PatentsView X-Api-Key
+
+
+# -------------------- HEADERS --------------------
+
+def get_headers():
+    return {
+        "X-API-KEY": USPTO_API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+
+# -------------------- UTILITIES --------------------
+
+def _safe_get_name(item: dict) -> str:
+    for k in ("inventorName", "assigneeNameText", "name", "fullName",
+              "partyNameText", "applicantNameText"):
+        v = item.get(k)
+        if v:
+            return v.strip()
+    first = item.get("firstName", "")
+    last = item.get("lastName", "")
+    return f"{first} {last}".strip()
+
+
+def _format_address(addr: Any) -> str:
+    """Format one address object (or scalar) into a single readable line."""
+    if isinstance(addr, str):
+        return addr.strip()
+    if not isinstance(addr, dict):
+        return ""
+
+    parts = [
+        addr.get("nameLineOneText"),
+        addr.get("nameLineTwoText"),
+        addr.get("addressLineOneText"),
+        addr.get("addressLineTwoText"),
+        addr.get("addressLineThreeText"),
+        addr.get("cityName"),
+        addr.get("geographicRegionCode") or addr.get("geographicRegionName"),
+        addr.get("postalCode"),
+        addr.get("countryName") or addr.get("countryCode"),
+    ]
+    return ", ".join([str(p).strip() for p in parts if p and str(p).strip()])
+
+
+def _extract_application_and_entity_status(am: Dict[str, Any]) -> Tuple[str, str]:
+    """Extract application status and entity status strings from applicationMetaData."""
+    status_desc = am.get("applicationStatusDescriptionText") or ""
+    status_code = am.get("applicationStatusCode")
+    status_date = am.get("applicationStatusDate")
+
+    status_bits = [status_desc]
+    if status_code not in (None, ""):
+        status_bits.append(f"code={status_code}")
+    if status_date:
+        status_bits.append(f"date={status_date}")
+    application_status = " | ".join([b for b in status_bits if b])
+
+    es = am.get("entityStatusData") or {}
+    # Use businessEntityStatusCategory as it's descriptive ("Regular Undiscounted", "Small", "Micro")
+    # No need to add redundant boolean indicators
+    category = es.get("businessEntityStatusCategory")
+    entity_status = str(category) if category else ""
+
+    return application_status, entity_status
+
+
+def _extract_wrapper_correspondence_address(patent_data: Dict[str, Any]) -> str:
+    """Extract correspondence address from wrapper-level metadata if available."""
+    am = patent_data.get("applicationMetaData", {}) or {}
+    bags = []
+    for key in ("correspondenceAddressBag", "correspondenceAddress"):
+        v = am.get(key)
+        if isinstance(v, list):
+            bags.extend(v)
+        elif isinstance(v, dict):
+            bags.append(v)
+    formatted = [_format_address(x) for x in bags]
+    return "; ".join([x for x in formatted if x])
+
+
+def _extract_assignment_correspondence_address(assignment: Dict[str, Any]) -> str:
+    """Extract correspondence address from an assignment record."""
+    bags = []
+    for key in ("correspondenceAddress", "correspondenceAddressBag"):
+        v = assignment.get(key)
+        if isinstance(v, list):
+            bags.extend(v)
+        elif isinstance(v, dict):
+            bags.append(v)
+
+    entries = []
+    for b in bags:
+        if not isinstance(b, dict):
+            continue
+        name = b.get("correspondentNameText") or b.get("nameLineOneText") or ""
+        addr = _format_address(b)
+        entry = " | ".join([x for x in [name, addr] if x])
+        if entry:
+            entries.append(entry)
+
+    return "; ".join(entries)
+
+
+def _extract_attorney_info(patent_data: Dict[str, Any]) -> Tuple[str, str]:
+    """Best-effort extraction of attorney name(s) and address(es) from wrapper payload."""
+    am = patent_data.get("applicationMetaData", {}) or {}
+
+    candidates = []
+    for holder in (patent_data, am):
+        if not isinstance(holder, dict):
+            continue
+        for key in (
+            "attorneyBag",
+            "attorneyInformationBag",
+            "attorneyDataBag",
+            "representativeBag",
+            "correspondenceAttorneyBag",
+            "powerOfAttorneyBag",
+        ):
+            v = holder.get(key)
+            if isinstance(v, list):
+                candidates.extend([x for x in v if isinstance(x, dict)])
+
+    names = []
+    addresses = []
+    for item in candidates:
+        name = (
+            item.get("attorneyNameText")
+            or item.get("representativeNameText")
+            or item.get("name")
+            or item.get("nameText")
+            or _safe_get_name(item)
+        )
+        if name and name not in names:
+            names.append(name)
+
+        addr_sources = []
+        for key in ("address", "addressData"):
+            v = item.get(key)
+            if isinstance(v, dict):
+                addr_sources.append(v)
+        for key in ("addressBag", "correspondenceAddress", "correspondenceAddressBag"):
+            v = item.get(key)
+            if isinstance(v, list):
+                addr_sources.extend([x for x in v if isinstance(x, dict)])
+            elif isinstance(v, dict):
+                addr_sources.append(v)
+
+        # Sometimes address fields are on the same object as attorney fields.
+        if any(k in item for k in ("addressLineOneText", "cityName", "postalCode", "countryName")):
+            addr_sources.append(item)
+
+        for src in addr_sources:
+            text = _format_address(src)
+            if text and text not in addresses:
+                addresses.append(text)
+
+    # Fallback: some records expose correspondent (often attorney/firm) only within assignmentBag.
+    if not names or not addresses:
+        for assignment in patent_data.get("assignmentBag", []) or []:
+            if not isinstance(assignment, dict):
+                continue
+            for key in ("correspondenceAddress", "correspondenceAddressBag"):
+                cbag = assignment.get(key)
+                if isinstance(cbag, dict):
+                    cbag = [cbag]
+                if not isinstance(cbag, list):
+                    continue
+                for c in cbag:
+                    if not isinstance(c, dict):
+                        continue
+                    cname = c.get("correspondentNameText") or c.get("nameLineOneText")
+                    if cname and cname not in names:
+                        names.append(cname)
+                    caddr = _format_address(c)
+                    if caddr and caddr not in addresses:
+                        addresses.append(caddr)
+
+    return "; ".join(names), "; ".join(addresses)
+
+
+def _fetch_application_metadata(application_number: str, delay: float = 0.0, debug: bool = False) -> Dict[str, Any]:
+    """Fetch patent file wrapper metadata for an application number from USPTO /meta-data."""
+    app_text = urllib.parse.quote(str(application_number), safe="")
+    url = f"https://api.uspto.gov/api/v1/patent/applications/{app_text}/meta-data"
+
+    max_retries = 3
+    attempt = 0
+    r = None
+    while attempt < max_retries:
+        r = requests.get(url, headers=get_headers())
+        if r.status_code == 200:
+            break
+        if r.status_code == 429:
+            retry_after = r.headers.get('Retry-After')
+            sleep_for = 5
+            if retry_after:
+                try:
+                    sleep_for = int(retry_after)
+                except Exception:
+                    sleep_for = 5
+            if debug:
+                print(f"⚠️  USPTO meta-data API 429: sleeping for {sleep_for}s before retry (app {application_number})")
+            time.sleep(sleep_for)
+            attempt += 1
+            continue
+        if 500 <= r.status_code < 600:
+            backoff = 2 ** attempt
+            if debug:
+                print(f"⚠️  USPTO meta-data API server error {r.status_code}, retrying in {backoff}s")
+            time.sleep(backoff)
+            attempt += 1
+            continue
+        if debug:
+            print(f"❌ USPTO meta-data API error {r.status_code}: {r.text} (app {application_number})")
+        return {}
+
+    if r is None or r.status_code != 200:
+        return {}
+
+    data = r.json()
+    bags = data.get("patentFileWrapperDataBag", [])
+    if not bags:
+        return {}
+
+    if delay and delay > 0:
+        time.sleep(delay)
+
+    return bags[0] if isinstance(bags[0], dict) else {}
+
+
+# -------------------- ODP ASSIGNMENT PIPELINE (UNCHANGED) --------------------
+
+def extract_inventors_and_date(patent_data: dict) -> Tuple[str, str, str, str]:
+    inventors = []
+    bags = []
+
+    if isinstance(patent_data.get("inventorBag"), list):
+        bags.extend(patent_data["inventorBag"])
+    if isinstance(patent_data.get("applicantBag"), list):
+        bags.extend(patent_data["applicantBag"])
+
+    am = patent_data.get("applicationMetaData", {}) or {}
+    for key in ("inventorBag", "applicantBag"):
+        if isinstance(am.get(key), list):
+            bags.extend(am[key])
+
+    for b in bags:
+        name = _safe_get_name(b)
+        if name and name not in inventors:
+            inventors.append(name)
+
+    date_regex = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+    def grab(d, keys):
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, str):
+                m = date_regex.search(v)
+                if m:
+                    return m.group(0)
+        return ""
+
+    filing = grab(am, ["filingDate", "effectiveFilingDate"])
+    issue = grab(am, ["grantDate", "patentIssueDate"])
+    pub = grab(am, ["earliestPublicationDate", "pctPublicationDate"])
+
+    return ("; ".join(inventors), filing, issue, pub)
+
+
+def process_patent_assignments(patent_number: str, delay: float = 0.0) -> pd.DataFrame:
+    """Query USPTO ODP for a patent's wrapper and return assignment rows.
+    Includes retry/backoff for 429 and 5xx errors and an optional inter-request delay.
+    """
+    url = "https://api.uspto.gov/api/v1/patent/applications/search"
+    payload = {
+        "q": f"applicationMetaData.patentNumber:{patent_number}",
+        "pagination": {"offset": 0, "limit": 1}
+    }
+
+    max_retries = 3
+    attempt = 0
+    r = None
+
+    while attempt < max_retries:
+        r = requests.post(url, headers=get_headers(), json=payload)
+        if r.status_code == 200:
+            break
+        # Handle 429 (Rate limited)
+        if r.status_code == 429:
+            # Prefer Retry-After header if present, else try to parse body for seconds
+            retry_after = r.headers.get('Retry-After')
+            sleep_for = None
+            if retry_after:
+                try:
+                    sleep_for = int(retry_after)
+                except Exception:
+                    # could be HTTP-date, fallback to parse body
+                    sleep_for = None
+            if not sleep_for:
+                try:
+                    detail = r.json().get('detail', '')
+                    m = re.search(r"(\d+)\s*seconds?", detail)
+                    if m:
+                        sleep_for = int(m.group(1)) + 1
+                except Exception:
+                    sleep_for = 5
+            sleep_for = sleep_for or 5
+            print(f"⚠️  USPTO 429: sleeping for {sleep_for}s before retry (patent {patent_number})")
+            time.sleep(sleep_for)
+            attempt += 1
+            continue
+        # 5xx server errors -> exponential backoff
+        if 500 <= r.status_code < 600:
+            backoff = (2 ** attempt)
+            print(f"⚠️  USPTO server error {r.status_code}, retrying in {backoff}s (patent {patent_number})")
+            time.sleep(backoff)
+            attempt += 1
+            continue
+        # Client errors or others: return an error row
+        print(f"❌ USPTO error {r.status_code}: {r.text} (patent {patent_number})")
+        return pd.DataFrame([{
+            "Patent Number": patent_number,
+            "Note": f"API error {r.status_code}"
+        }])
+
+    if r is None or r.status_code != 200:
+        return pd.DataFrame([{
+            "Patent Number": patent_number,
+            "Note": "Request failed after retries"
+        }])
+
+    data = r.json()
+    bags = data.get("patentFileWrapperDataBag", [])
+    if not bags:
+        return pd.DataFrame([{
+            "Patent Number": patent_number,
+            "Note": "Not found"
+        }])
+
+    # optional delay to space out subsequent calls
+    if delay and delay > 0:
+        time.sleep(delay)
+
+    patent_data = bags[0]
+    inventors, filing, issue, pub = extract_inventors_and_date(patent_data)
+    am = patent_data.get("applicationMetaData", {}) or {}
+    application_status, entity_status = _extract_application_and_entity_status(am)
+    wrapper_correspondence = _extract_wrapper_correspondence_address(patent_data)
+    attorney_names, attorney_addresses = _extract_attorney_info(patent_data)
+    assignments = patent_data.get("assignmentBag", [])
+
+    rows = []
+    for a in assignments:
+        assignees = [
+            _safe_get_name(x)
+            for x in a.get("assigneeBag", [])
+            if _safe_get_name(x)
+        ]
+
+        rows.append({
+            "Patent Number": patent_number,
+            "Inventors": inventors,
+            "Filing Date": filing,
+            "Issue Date": issue,
+            "Publication Date": pub,
+            "Application Status": application_status,
+            "Entity Status": entity_status,
+            "Recorded Date": a.get("assignmentRecordedDate"),
+            "Conveyance": a.get("conveyanceText"),
+            "Assignees": "; ".join(assignees),
+            "Reel/Frame": a.get("reelAndFrameNumber"),
+            "Correspondent Address": _extract_assignment_correspondence_address(a) or wrapper_correspondence,
+            "Attorney Name": attorney_names,
+            "Attorney Address": attorney_addresses,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def fetch_assignments_from_uspto_assignment_api(patent_number: str, application_number: Optional[str] = None, delay: float = 0.0, debug: bool = False) -> pd.DataFrame:
+    """Fetch assignment records from the USPTO Assignment API using applicationNumberText.
+
+    If application_number is not provided, try to resolve it via PatentsView for the given patent_number.
+    Returns a DataFrame of rows similar to `process_patent_assignments` or a single-row DataFrame with a Note on failure.
+    """
+    # Resolve application number via PatentsView if not provided
+    if not application_number:
+        pv_key = PATENTSVIEW_API_KEY
+        if not pv_key:
+            if debug:
+                print("🔎 No PATENTSVIEW_API_KEY available to resolve application number")
+            return pd.DataFrame([{"Patent Number": patent_number, "Note": "No application number and no PatentsView API key"}])
+
+            headers = {"X-Api-Key": pv_key, "Accept": "application/json"}
+
+            # 1) Try the per-patent GET endpoint (works in SwaggerUI)
+            try:
+                get_url = f"https://search.patentsview.org/api/v1/patent/{urllib.parse.quote(str(patent_number))}/"
+                if debug:
+                    print(f"🔎 Trying PatentsView GET {get_url}")
+                r = requests.get(get_url, headers=headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    patents = data.get("patents", [])
+                    if patents:
+                        p = patents[0]
+                        app_list = p.get("application") or p.get("applicationBag")
+                        if isinstance(app_list, list):
+                            for app in app_list:
+                                if not isinstance(app, dict):
+                                    continue
+                                for key in ("application_id", "applicationNumberText", "applicationNumber", "application_number_text", "application_number"):
+                                    val = app.get(key)
+                                    if val:
+                                        application_number = str(val)
+                                        break
+                                if application_number:
+                                    break
+                        if not application_number:
+                            for key in ("application_number", "application_number_text", "applicationNumber", "applicationNumberText", "application_id"):
+                                val = p.get(key)
+                                if val:
+                                    application_number = str(val)
+                                    break
+                else:
+                    if debug:
+                        print(f"🔎 PatentsView GET failed HTTP {r.status_code}: {r.text}")
+            except Exception as e:
+                if debug:
+                    print(f"🔎 PatentsView GET exception: {e}")
+
+            # 2) If GET didn't resolve an application number, fall back to the POST search
+            if not application_number:
+                try:
+                    pv_url = "https://search.patentsview.org/api/v1/patent/"
+                    body = {"q": {"patent_id": patent_number}, "f": ["patent_id", "application_number", "application_number_text"], "o": {"size": 1}}
+                    if debug:
+                        print(f"🔎 Trying PatentsView POST search for patent_id={patent_number}")
+                    r = requests.post(pv_url, headers=headers, json=body)
+                    if r.status_code != 200:
+                        if debug:
+                            print(f"🔎 PatentsView POST lookup failed HTTP {r.status_code}: {r.text}")
+                    else:
+                        data = r.json()
+                        patents = data.get("patents", [])
+                        if patents:
+                            p = patents[0]
+                            app_list = p.get("application") or p.get("applicationBag")
+                            if isinstance(app_list, list):
+                                for app in app_list:
+                                    if not isinstance(app, dict):
+                                        continue
+                                    for key in ("application_id", "applicationNumber", "application_number", "application_number_text", "applicationNumberText"):
+                                        val = app.get(key)
+                                        if val:
+                                            application_number = str(val)
+                                            break
+                                    if application_number:
+                                        break
+                            if not application_number:
+                                for key in ("application_number", "application_number_text", "applicationNumber", "applicationNumberText", "application_id"):
+                                    val = p.get(key)
+                                    if val:
+                                        application_number = str(val)
+                                        break
+                except Exception as e:
+                    if debug:
+                        print(f"🔎 PatentsView POST lookup exception: {e}")
+
+    if not application_number:
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "No application number found for assignment API"}])
+
+    # Call USPTO Assignment endpoint for the application number
+    app_text = urllib.parse.quote(application_number, safe="")
+    url = f"https://api.uspto.gov/api/v1/patent/applications/{app_text}/assignment"
+
+    max_retries = 3
+    attempt = 0
+    r = None
+    while attempt < max_retries:
+        r = requests.get(url, headers=get_headers())
+        if r.status_code == 200:
+            break
+        if r.status_code == 429:
+            retry_after = r.headers.get('Retry-After')
+            sleep_for = 5
+            if retry_after:
+                try:
+                    sleep_for = int(retry_after)
+                except Exception:
+                    sleep_for = 5
+            if debug:
+                print(f"⚠️  USPTO Assignment API 429: sleeping for {sleep_for}s before retry (patent {patent_number})")
+            time.sleep(sleep_for)
+            attempt += 1
+            continue
+        if 500 <= r.status_code < 600:
+            backoff = 2 ** attempt
+            if debug:
+                print(f"⚠️  USPTO Assignment API server error {r.status_code}, retrying in {backoff}s")
+            time.sleep(backoff)
+            attempt += 1
+            continue
+        # other client errors -> give up
+        if debug:
+            print(f"❌ USPTO Assignment API error {r.status_code}: {r.text} (app {application_number})")
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": f"Assignment API error {r.status_code}"}])
+
+    if r is None or r.status_code != 200:
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "Assignment request failed after retries"}])
+
+    data = r.json()
+
+    # Default enrichment: fetch /meta-data for status/entity/attorney/correspondence context.
+    meta_wrapper = _fetch_application_metadata(application_number, delay=delay, debug=debug)
+    meta_am = meta_wrapper.get("applicationMetaData", {}) if isinstance(meta_wrapper, dict) else {}
+    meta_inventors, meta_filing, meta_issue, meta_pub = extract_inventors_and_date(meta_wrapper) if meta_wrapper else ("", "", "", "")
+    meta_application_status, meta_entity_status = _extract_application_and_entity_status(meta_am) if isinstance(meta_am, dict) else ("", "")
+    meta_wrapper_correspondence = _extract_wrapper_correspondence_address(meta_wrapper) if meta_wrapper else ""
+    meta_attorney_names, meta_attorney_addresses = _extract_attorney_info(meta_wrapper) if meta_wrapper else ("", "")
+
+    # Detect assignment list in response; check common keys
+    candidates = []
+    for k in ("assignmentBag", "assignments", "patentAssignmentDataBag", "data", "assignment"):
+        v = data.get(k)
+        if isinstance(v, list) and v:
+            candidates = v
+            break
+
+    # If not found under those keys, try to find any list value in the response
+    if not candidates:
+        for v in data.values():
+            if isinstance(v, list) and v:
+                candidates = v
+                break
+
+    if not candidates:
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "No assignments found in Assignment API response"}])
+
+    rows = []
+    for a in candidates:
+        # try to extract assignees
+        assignees = []
+        for bkey in ("assigneeBag", "assignees", "assignee"):
+            bag = a.get(bkey)
+            if isinstance(bag, list):
+                for item in bag:
+                    name = _safe_get_name(item)
+                    if name:
+                        assignees.append(name)
+                if assignees:
+                    break
+
+        recorded = a.get("assignmentRecordedDate") or a.get("recordedDate") or a.get("recordingDate")
+        convey = a.get("conveyanceText") or a.get("conveyance")
+        reelframe = a.get("reelAndFrameNumber") or a.get("reel")
+
+        rows.append({
+            "Patent Number": patent_number,
+            "Inventors": meta_inventors,
+            "Filing Date": meta_filing,
+            "Issue Date": meta_issue,
+            "Publication Date": meta_pub,
+            "Application Status": meta_application_status,
+            "Entity Status": meta_entity_status,
+            "Recorded Date": recorded,
+            "Conveyance": convey,
+            "Assignees": "; ".join(assignees),
+            "Reel/Frame": reelframe,
+            "Correspondent Address": _extract_assignment_correspondence_address(a) or meta_wrapper_correspondence,
+            "Attorney Name": meta_attorney_names,
+            "Attorney Address": meta_attorney_addresses,
+        })
+
+    # optional delay
+    if delay and delay > 0:
+        time.sleep(delay)
+
+    return pd.DataFrame(rows)
+
+
+def fetch_assignments_from_patentsview(patent_number: str, api_key: Optional[str] = None, delay: float = 0.0, debug: bool = False) -> pd.DataFrame:
+    """Fetch assignee information directly from PatentsView per-patent endpoint.
+
+    This is a fallback used when the USPTO wrapper and Assignment API do not
+    return usable assignment rows. It will call the PatentsView GET
+    `/api/v1/patent/<patent_id>/` endpoint (the same as the SwaggerUI example)
+    and convert the `assignees` array into rows that match the other
+    DataFrame output columns.
+    """
+    api_key = api_key or PATENTSVIEW_API_KEY
+    if not api_key:
+        if debug:
+            print("🔎 No PATENTSVIEW_API_KEY available for per-patent lookup")
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "No PatentsView API key"}])
+
+    url = f"https://search.patentsview.org/api/v1/patent/{urllib.parse.quote(str(patent_number))}/"
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+    try:
+        r = requests.get(url, headers=headers)
+    except Exception as e:
+        if debug:
+            print(f"🔎 PatentsView per-patent request exception for {patent_number}: {e}")
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": f"PatentsView request exception: {e}"}])
+
+    if r.status_code != 200:
+        if debug:
+            print(f"🔎 PatentsView per-patent HTTP {r.status_code}: {r.text}")
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": f"PatentsView HTTP {r.status_code}"}])
+
+    data = r.json()
+    patents = data.get("patents") or []
+    if not patents:
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "No patent record in PatentsView response"}])
+
+    p = patents[0]
+    patent_date = p.get("patent_date") or p.get("patentDate") or ""
+    # Inventors
+    inventors_list = []
+    for inv in p.get("inventors") or []:
+        first = inv.get("inventor_name_first") or inv.get("inventor_name_first") or inv.get("inventor_first_name") or inv.get("inventorFirstName") or ""
+        last = inv.get("inventor_name_last") or inv.get("inventor_name_last") or inv.get("inventor_last_name") or inv.get("inventorLastName") or ""
+        name = (f"{first} {last}".strip())
+        if name:
+            inventors_list.append(name)
+
+    inventors = "; ".join(inventors_list)
+
+    # Filing / publication dates may appear in application or top-level fields
+    filing = ""
+    pub = ""
+    app_list = p.get("application") or p.get("applicationBag") or []
+    if isinstance(app_list, list) and app_list:
+        for app in app_list:
+            if not isinstance(app, dict):
+                continue
+            for k in ("filing_date", "filingDate", "application_filing_date", "filingDateText"):
+                if not filing:
+                    v = app.get(k)
+                    if v:
+                        filing = str(v)
+            # publication date sometimes attached to application
+            for k in ("publication_date", "publicationDate", "application_publication_date"):
+                if not pub:
+                    v = app.get(k)
+                    if v:
+                        pub = str(v)
+
+    # fallback to patent-level publication fields
+    if not pub:
+        for k in ("publication_date", "publicationDate", "patent_publication_date"):
+            v = p.get(k)
+            if v:
+                pub = str(v)
+                break
+
+    assignees = p.get("assignees") or []
+
+    rows = []
+    for a in assignees:
+        org = a.get("assignee_organization") or a.get("assignee_organization_std") or a.get("assignee")
+        first = a.get("assignee_individual_name_first") or a.get("assignee_first_name") or ""
+        last = a.get("assignee_individual_name_last") or a.get("assignee_last_name") or ""
+        name = org or (f"{first} {last}".strip())
+
+        # attempt to extract assignment-like fields if present (PatentsView may not include these)
+        recorded = a.get("recorded_date") or a.get("assignment_recorded_date") or ""
+        convey = a.get("conveyance") or a.get("conveyance_text") or ""
+        reelframe = a.get("reel_and_frame_number") or a.get("reelAndFrameNumber") or ""
+
+        rows.append({
+            "Patent Number": patent_number,
+            "Inventors": inventors,
+            "Filing Date": filing,
+            "Issue Date": patent_date,
+            "Publication Date": pub,
+            "Application Status": "",
+            "Entity Status": "",
+            "Recorded Date": recorded,
+            "Conveyance": convey,
+            "Assignees": name,
+            "Reel/Frame": reelframe,
+            "Correspondent Address": "",
+            "Attorney Name": "",
+            "Attorney Address": "",
+            "Source": "PatentsView"
+        })
+
+    if delay and delay > 0:
+        time.sleep(delay)
+
+    if not rows:
+        return pd.DataFrame([{"Patent Number": patent_number, "Note": "No assignees in PatentsView record"}])
+
+    return pd.DataFrame(rows)
+
+
+# -------------------- INPUT LOADERS --------------------
+
+def load_patent_numbers_from_args(inputs: List[str]) -> List[str]:
+    if len(inputs) == 1 and os.path.isfile(inputs[0]):
+        with open(inputs[0]) as f:
+            return [l.strip() for l in f if l.strip()]
+    return [x for x in " ".join(inputs).replace(",", " ").split() if x]
+
+
+def load_assignees_from_args(inputs: List[str]) -> List[str]:
+    if len(inputs) == 1 and os.path.isfile(inputs[0]):
+        with open(inputs[0]) as f:
+            return [l.strip() for l in f if l.strip()]
+    return [x.strip() for x in " ".join(inputs).split(",") if x.strip()]
+
+
+# -------------------- PATENTSVIEW (CORRECT ASSIGNEE SEARCH) --------------------
+
+
+def get_assignee_ids(assignee_name: str, api_key: Optional[str] = None, debug: bool = False) -> List[str]:
+    """Resolve an assignee organization name to one or more assignee_id values via the `/assignee/` endpoint."""
+    api_key = api_key or PATENTSVIEW_API_KEY
+    if not api_key:
+        return []
+
+    url = "https://search.patentsview.org/api/v1/assignee/"
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+    body = {"q": {"_text_phrase": {"assignee_organization": assignee_name}}, "f": ["assignee_id"]}
+
+    try:
+        r = requests.post(url, headers=headers, json=body)
+    except Exception as e:
+        if debug:
+            print(f"❌ Assignee lookup failed: {e}")
+        return []
+
+    if r.status_code != 200:
+        if debug:
+            print(f"❌ Assignee lookup HTTP {r.status_code}: {r.text}")
+        return []
+
+    data = r.json()
+    items = data.get("assignees", [])
+    ids = [a.get("assignee_id") for a in items if a.get("assignee_id")]
+    if debug:
+        print(f"🔎 Found assignee_ids: {ids}")
+    return ids
+
+
+def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None, per_page: int = 100, max_pages: int = 10, debug: bool = False, duplicate_threshold: int = 3) -> List[str]:
+    """Search patents for an assignee using PatentsView. Requires X-Api-Key either via
+    the environment variable PATENTSVIEW_API_KEY or passed via the api_key parameter.
+
+    Adds optional debug output and tolerates a small number of consecutive pages
+    that contain only duplicates before stopping (useful if the API returns
+    overlapping pages).
+    """
+    api_key = api_key or PATENTSVIEW_API_KEY
+    if not api_key:
+        print("Error: PatentsView API key not provided. Set PATENTSVIEW_API_KEY in your environment or pass --patentsview-key.")
+        sys.exit(2)
+
+    url = "https://search.patentsview.org/api/v1/patent/"
+    headers = {
+        "X-Api-Key": api_key,
+        "Accept": "application/json"
+    }
+
+    # Resolve assignee name to one or more assignee_id values and prefer ID-based queries
+    ids = get_assignee_ids(assignee_name, api_key=api_key, debug=debug)
+    use_ids = bool(ids)
+    if debug:
+        if use_ids:
+            print(f"🔎 Using assignee_id(s) lookup first: {ids}")
+        else:
+            print("🔎 No assignee_id found; will use text query fallback")
+
+    all_patents = set()
+    page = 0
+    offset = 0
+    consecutive_no_new = 0
+
+    # PatentsView uses offset/size for pagination; include 'o': {'size': per_page, 'from': offset}
+    # We'll increment the offset by `per_page` each loop so pages advance correctly
+    max_retries = 3
+
+    # Cursor-based pagination using `after` + explicit sort by `patent_id` to ensure deterministic pages
+    after = None
+    total = None
+    # optional page-level progress bar
+    page_bar = tqdm(total=max_pages, desc=f"PatentsView pages for {assignee_name}", unit="page") if tqdm else None
+    while page < max_pages:
+        page_num = page + 1
+        if use_ids:
+            body = {
+                "q": {"assignees.assignee_id": ids},
+                "f": ["patent_id"],
+                "s": [{"patent_id": "asc"}],
+                "o": {"size": per_page}
+            }
+        else:
+            body = {
+                "q": {"_text_phrase": {"assignees.assignee_organization": assignee_name}},
+                "f": ["patent_id"],
+                "s": [{"patent_id": "asc"}],
+                "o": {"size": per_page}
+            }
+        if after:
+            body["o"]["after"] = after
+
+        if debug:
+            qtype = "id" if use_ids else "text"
+            print(f"🔍 Request page {page_num} (after={after}, size={per_page}, query={qtype})")
+        if page_bar:
+            page_bar.update(1)
+
+        attempt = 0
+        r = None
+        while attempt < max_retries:
+            r = requests.post(url, headers=headers, json=body)
+            if r.status_code == 200:
+                break
+            # Provide extra debug for 4xx client errors to help diagnose invalid queries
+            if 400 <= r.status_code < 500:
+                reason = r.headers.get('X-Status-Reason') or r.headers.get('X-Status-Reason-Code')
+                print(f"❌ PatentsView client error {r.status_code}: {r.text}")
+                if reason:
+                    print(f"  X-Status-Reason: {reason}")
+                r = None
+                break
+            # Handle 429 throttling specifically: look for 'Expected available in X seconds.'
+            if r.status_code == 429:
+                sleep_for = None
+                try:
+                    detail = r.json().get('detail', '')
+                    m = re.search(r"(\d+)\s*seconds?", detail)
+                    if m:
+                        sleep_for = int(m.group(1)) + 1
+                except Exception:
+                    sleep_for = 5
+                sleep_for = sleep_for or 5
+                print(f"⚠️  PatentsView 429: sleeping for {sleep_for}s before retry (page {page_num})")
+                time.sleep(sleep_for)
+                attempt += 1
+                continue
+            # For other 5xx errors/backoff
+            if 500 <= r.status_code < 600:
+                backoff = (2 ** attempt)
+                print(f"⚠️  PatentsView server error {r.status_code}, retrying in {backoff}s")
+                time.sleep(backoff)
+                attempt += 1
+                continue
+            # For other failures, break and report
+            print(f"❌ PatentsView error {r.status_code}: {r.text}")
+            r = None
+            break
+
+        if r is None or r.status_code != 200:
+            break
+
+        data = r.json()
+        patents = data.get("patents", [])
+
+        # total_hits is the field for PatentSearch API; initialize once
+        if 'total' not in locals():
+            total = None
+        if total is None:
+            total = data.get("total_hits") or data.get("total") or data.get("count") or data.get("total_count")
+        if debug and total is not None:
+            print(f"ℹ️  API reports total={total}")
+
+        # If text query returned nothing and we haven't tried ID lookup, try ID lookup once
+        if not patents and not use_ids:
+            if debug:
+                print("• Text query returned no patents — attempting assignee_id lookup fallback")
+            ids = get_assignee_ids(assignee_name, api_key=api_key, debug=debug)
+            if ids:
+                use_ids = True
+                if debug:
+                    print(f"🔁 Fallback found assignee_id(s): {ids}; switching to ID-based queries")
+                id_body = {
+                    "q": {"assignees.assignee_id": ids},
+                    "f": ["patent_id"],
+                    "s": [{"patent_id": "asc"}],
+                    "o": {"size": per_page}
+                }
+                if after:
+                    id_body["o"]["after"] = after
+                r = requests.post(url, headers=headers, json=id_body)
+                if r.status_code == 200:
+                    data = r.json()
+                    patents = data.get("patents", [])
+                    if debug:
+                        print(f"• Fallback ID query returned {len(patents)} patents")
+                else:
+                    if debug:
+                        print(f"❌ Fallback ID query failed HTTP {r.status_code}: {r.text}")
+
+        if not patents:
+            if debug:
+                print("• Server returned empty patents list — stopping")
+            break
+
+        added_this_page = 0
+        last_id = None
+        for p in patents:
+            pn = p.get("patent_id")
+            if pn:
+                last_id = pn
+                if pn not in all_patents:
+                    all_patents.add(pn)
+                    added_this_page += 1
+
+        sample_ids = [p.get("patent_id") for p in patents[:5]]
+        print(f"• Page {page_num}: {len(patents)} patents, added this page: {added_this_page}, total so far: {len(all_patents)}")
+        if debug:
+            print(f"  sample ids: {sample_ids}")
+
+        # If the page returned fewer patents than requested, we've likely reached the end
+        if len(patents) < per_page:
+            if debug:
+                print("• Page returned fewer than requested; reached end")
+            break
+
+        # Handle pages that return only duplicates — allow a small number in case of overlap
+        if added_this_page == 0:
+            consecutive_no_new += 1
+            print(f"• No new patents on this page (consecutive={consecutive_no_new})")
+            if consecutive_no_new >= duplicate_threshold:
+                print(f"• {consecutive_no_new} consecutive duplicate pages — stopping pagination")
+                break
+        else:
+            consecutive_no_new = 0
+
+        # If we have a reliable total, stop if we've requested past it
+        if isinstance(total, int) and (page * per_page) >= total:
+            if debug:
+                print("• Requested past reported total; stopping")
+            break
+
+        # Prepare cursor for next iteration
+        if last_id:
+            after = last_id
+        else:
+            break
+
+        page += 1
+
+    print(f"✅ Found {len(all_patents)} patents for assignee '{assignee_name}'")
+    if page_bar:
+        page_bar.close()
+    return sorted(all_patents)
+
+# -------------------- MAIN --------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("inputtype", choices=["bypatentnumber", "byassignee"])
+    parser.add_argument("inputs", nargs="*")
+    parser.add_argument("-o", "--out", default="all_assignments")
+    parser.add_argument("--patentsview-key", default=None, help="PatentsView X-Api-Key (overrides PATENTSVIEW_API_KEY env var)")
+    parser.add_argument("--delay", type=float, default=0.2, help="Delay in seconds between USPTO requests (helps avoid rate limits). Default: 0.2s")
+    parser.add_argument("--per-page", type=int, default=100, help="Number of patents to request per page from PatentsView (default: 100)")
+    parser.add_argument("--max-pages", type=int, default=10, help="Maximum number of pages to request (default: 10)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output for PatentsView pagination")
+    args = parser.parse_args()
+
+    if args.inputtype == "bypatentnumber":
+        patent_numbers = load_patent_numbers_from_args(args.inputs)
+    else:
+        assignees = load_assignees_from_args(args.inputs)
+        patent_numbers = []
+        for a in assignees:
+            patent_numbers.extend(search_patents_by_assignee(a, api_key=args.patentsview_key, per_page=args.per_page, max_pages=args.max_pages, debug=args.debug))
+
+    patent_numbers = sorted(set(patent_numbers))
+    if not patent_numbers:
+        print("No patent numbers found.")
+        sys.exit(1)
+
+    all_rows = []
+    failed_patents = []
+
+    # Primary processing loop with optional tqdm progress bar
+    if tqdm:
+        for pn in tqdm(patent_numbers, desc="Processing patents", unit="patent"):
+            df = process_patent_assignments(pn, delay=args.delay)
+            if df.empty:
+                continue
+            if "Note" in df.columns and df.shape[0] == 1 and pd.notna(df.iloc[0].get("Note", None)):
+                failed_patents.append(pn)
+            else:
+                all_rows.append(df)
+    else:
+        total = len(patent_numbers)
+        for idx, pn in enumerate(patent_numbers, start=1):
+            print(f"\rProcessing {idx}/{total}: {pn}", end="", flush=True)
+            df = process_patent_assignments(pn, delay=args.delay)
+            if df.empty:
+                continue
+            if "Note" in df.columns and df.shape[0] == 1 and pd.notna(df.iloc[0].get("Note", None)):
+                failed_patents.append(pn)
+            else:
+                all_rows.append(df)
+
+    # ensure progress line ends
+    print()
+
+    # If any patents failed, save them and retry once (pipes into process_patent_assignments again)
+    if failed_patents:
+        print(f"\n⚠️  {len(failed_patents)} patents returned no wrapper/assignments on first pass. Saving to not_found_patents.txt and retrying once.")
+        with open("not_found_patents.txt", "w") as nf:
+            for p in failed_patents:
+                nf.write(p + "\n")
+
+        # Retry failed patents once (sometimes transient 404s or rate issues)
+        retried = []
+        still_failed = []
+        if tqdm:
+            for pn in tqdm(failed_patents, desc="Retrying patents", unit="patent"):
+                df = process_patent_assignments(pn, delay=args.delay)
+                if df.empty:
+                    still_failed.append(pn)
+                    continue
+                if "Note" in df.columns and df.shape[0] == 1 and pd.notna(df.iloc[0].get("Note", None)):
+                    still_failed.append(pn)
+                else:
+                    all_rows.append(df)
+                    retried.append(pn)
+        else:
+            retry_total = len(failed_patents)
+            for r_idx, pn in enumerate(failed_patents, start=1):
+                print(f"\rRetrying {r_idx}/{retry_total}: {pn}", end="", flush=True)
+                df = process_patent_assignments(pn, delay=args.delay)
+                if df.empty:
+                    still_failed.append(pn)
+                    continue
+                if "Note" in df.columns and df.shape[0] == 1 and pd.notna(df.iloc[0].get("Note", None)):
+                    still_failed.append(pn)
+                else:
+                    all_rows.append(df)
+                    retried.append(pn)
+
+        # finish retry progress line
+        print()
+        print(f"🔁 Retried: {len(retried)} succeeded, {len(still_failed)} still missing")
+        if still_failed:
+            # Attempt assignment-API fallback for still-missing patents
+            print("\n🔁 Attempting USPTO Assignment API fallback for unresolved patents...")
+            recovered = []
+            remaining = []
+            for pn in still_failed:
+                # First try PatentsView per-patent endpoint (Swagger UI shows assignees here)
+                pv_df = fetch_assignments_from_patentsview(pn, api_key=args.patentsview_key, delay=args.delay, debug=args.debug)
+                if pv_df is not None and not pv_df.empty:
+                    if not ("Note" in pv_df.columns and pv_df.shape[0] == 1 and pd.notna(pv_df.iloc[0].get("Note", None))):
+                        all_rows.append(pv_df)
+                        recovered.append(pn)
+                        continue
+
+                # If PatentsView per-patent did not yield usable rows, fall back to USPTO Assignment API
+                df_assign = fetch_assignments_from_uspto_assignment_api(pn, delay=args.delay, debug=args.debug)
+                if df_assign is None or df_assign.empty:
+                    remaining.append(pn)
+                    continue
+                # treat single-row Note as failure
+                if "Note" in df_assign.columns and df_assign.shape[0] == 1 and pd.notna(df_assign.iloc[0].get("Note", None)):
+                    remaining.append(pn)
+                    continue
+                # append recovered rows
+                all_rows.append(df_assign)
+                recovered.append(pn)
+
+            print(f"🔁 Assignment API recovered: {len(recovered)} patents, still missing: {len(remaining)}")
+            # overwrite not_found_patents.txt with remaining unresolved patents
+            with open("not_found_patents.txt", "w") as nf:
+                for p in remaining:
+                    nf.write(p + "\n")
+            if remaining:
+                print(f"Saved list of unresolved patents to not_found_patents.txt")
+
+    if all_rows:
+        out = pd.concat(all_rows, ignore_index=True)
+        # Remove extension if provided, then save both CSV and XLSX
+        base_name = args.out.rsplit('.', 1)[0] if '.' in args.out else args.out
+        csv_file = f"{base_name}.csv"
+        xlsx_file = f"{base_name}.xlsx"
+        
+        out.to_csv(csv_file, index=False)
+        print(f"\n✅ Saved: {csv_file}")
+        
+        try:
+            out.to_excel(xlsx_file, index=False, engine='openpyxl')
+            print(f"✅ Saved: {xlsx_file}")
+        except ImportError:
+            print(f"⚠️  Could not save XLSX (install openpyxl: pip install openpyxl)")
+
+
+if __name__ == "__main__":
+    main()
