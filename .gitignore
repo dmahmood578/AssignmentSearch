@@ -1,4 +1,5 @@
 patentsearch-venv/
 query_results/
 patent_text_results/
+assignment_results/
 not_found_patents.txt

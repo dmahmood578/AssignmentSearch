@@ -1148,6 +1148,8 @@ def fetch_patent_text_batch(
     batches = [patent_ids[i: i + batch_size] for i in range(0, len(patent_ids), batch_size)]
     total_batches = len(batches)
 
+    bar = tqdm(total=len(patent_ids), desc="Fetching patent text", unit="patent") if tqdm else None
+
     for b_idx, batch in enumerate(batches, start=1):
         if debug:
             print(f"  [patent text] batch {b_idx}/{total_batches} ({len(batch)} ids)")
@@ -1218,9 +1220,13 @@ def fetch_patent_text_batch(
                 "Note": "",
             })
 
+        if bar:
+            bar.update(len(batch))
         if delay and delay > 0:
             time.sleep(delay)
 
+    if bar:
+        bar.close()
     return pd.DataFrame(rows)
 
 
@@ -1253,6 +1259,8 @@ def fetch_publication_text_batch(
     rows = []
     batches = [doc_numbers[i: i + batch_size] for i in range(0, len(doc_numbers), batch_size)]
     total_batches = len(batches)
+
+    bar = tqdm(total=len(doc_numbers), desc="Fetching publication text", unit="pub") if tqdm else None
 
     for b_idx, batch in enumerate(batches, start=1):
         if debug:
@@ -1317,9 +1325,13 @@ def fetch_publication_text_batch(
                 "Note": "",
             })
 
+        if bar:
+            bar.update(len(batch))
         if delay and delay > 0:
             time.sleep(delay)
 
+    if bar:
+        bar.close()
     return pd.DataFrame(rows)
 
 
@@ -1411,7 +1423,8 @@ def main():
     else:
         assignees = load_assignees_from_args(args.inputs)
         patent_numbers = []
-        for a in assignees:
+        assignee_iter = tqdm(assignees, desc="Searching assignees", unit="assignee") if tqdm else assignees
+        for a in assignee_iter:
             patent_numbers.extend(search_patents_by_assignee(a, api_key=args.patentsview_key, per_page=args.per_page, max_pages=args.max_pages, debug=args.debug))
 
     patent_numbers = sorted(set(patent_numbers))
@@ -1535,14 +1548,18 @@ def main():
 
     if all_rows:
         out = pd.concat(all_rows, ignore_index=True)
-        # Remove extension if provided, then save both CSV and XLSX
+        # Save to assignment_results/ with timestamp, like patent_text_results
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = args.out.rsplit('.', 1)[0] if '.' in args.out else args.out
-        csv_file = f"{base_name}.csv"
-        xlsx_file = f"{base_name}.xlsx"
-        
+        out_dir = "assignment_results"
+        os.makedirs(out_dir, exist_ok=True)
+        csv_file = os.path.join(out_dir, f"{base_name}_{ts}.csv")
+        xlsx_file = os.path.join(out_dir, f"{base_name}_{ts}.xlsx")
+
         out.to_csv(csv_file, index=False)
         print(f"\n✅ Saved: {csv_file}")
-        
+
         try:
             out.to_excel(xlsx_file, index=False, engine='openpyxl')
             print(f"✅ Saved: {xlsx_file}")

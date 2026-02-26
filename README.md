@@ -55,7 +55,9 @@ python AssignmentSearch.py byassignee assignees.txt --per-page 100 --max-pages 2
 ```
 Note that `assignees.txt` is newline-delimited
 
-The script successfully returns patent assignments in the terminal and as a CSV file: `all_patent_assignments.csv`
+The script returns patent assignments as timestamped CSV and XLSX files in `assignment_results/`:
+- `assignment_results/all_assignments_YYYYMMDD_HHMMSS.csv`
+- `assignment_results/all_assignments_YYYYMMDD_HHMMSS.xlsx`
 
 #### Extract Patent Abstracts and Field of Invention (`--text`)
 
@@ -89,23 +91,51 @@ Requires `PATENTSVIEW_API_KEY` to be set (same key used for `byassignee` mode).
 
 ### queries.py - Query and Filter Patent Data
 
-Run SQL queries on your patent assignment data and export results to CSV/XLSX files.
+Run SQL queries across one or both result tables and export to CSV/XLSX.
 
 #### Run the Query Tool
 ```bash
+# Interactive — type your query after the date prompts
 python queries.py
+
+# Pass a .sql file directly — skips the interactive query prompt
+python queries.py myquery.sql
+python queries.py --query myquery.sql
+
+# Pipe — loads ALL available files (no prompts), query comes from the file
+python queries.py < myquery.sql
 ```
 
 The tool will:
-1. Display an example query
-2. Load data from `all_assignments.xlsx` or `all_assignments.csv`
-3. Prompt you to enter your SQL query
-4. Execute the query and save results to timestamped CSV and XLSX files
+1. List all available result files in `assignment_results/` and `patent_text_results/`
+2. Ask whether to load each table, and for what **date/time range** of run outputs to include
+3. Concatenate all matching files into the selected tables
+4. Show example queries, then prompt for your SQL
+5. Save results to `query_results/query_results_YYYYMMDD_HHMMSS.{csv,xlsx}`
 
-#### Example Query
-The tool displays this example on startup:
+#### Available Tables
+
+| Table name | Source folder | Populated by |
+|---|---|---|
+| `all_assignments` | `assignment_results/` | Running without `--text` |
+| `patent_text` | `patent_text_results/` | Running with `--text` |
+
+#### Date Range Selection
+
+When prompted, enter a start and/or end to narrow which run files are loaded. Press Enter to include all files.
+
+```
+From (e.g. 2026-02-26 or 20260226_130000): 2026-02-26
+To   (e.g. 2026-02-26 or 20260226_235959):          ← Enter = no upper bound
+```
+
+Multiple files within the range are concatenated automatically.
+
+#### Example Queries
+
+**Query assignments only:**
 ```sql
-SELECT 
+SELECT
     "Patent Number",
     Inventors,
     Assignees,
@@ -113,20 +143,50 @@ SELECT
     "Attorney Name",
     "Attorney Address"
 FROM all_assignments
-WHERE 
+WHERE
     "Application Status" LIKE '%Patented Case%'
     AND ("Entity Status" = 'Micro' OR "Entity Status" = 'Small')
     AND Conveyance = 'ASSIGNMENT OF ASSIGNOR''S INTEREST'
 ```
 
-**Note:** Column names with spaces must be wrapped in double quotes (e.g., `"Patent Number"`, `"Attorney Name"`).
+**Query patent text only:**
+```sql
+SELECT
+    "Patent Number",
+    "Patent Title",
+    "WIPO Field of Invention",
+    "CPC Primary",
+    Abstract
+FROM patent_text
+WHERE "WIPO Field of Invention" LIKE '%Computer technology%'
+```
+
+**Join both tables:**
+```sql
+SELECT
+    a."Patent Number",
+    a.Assignees,
+    t."WIPO Field of Invention",
+    t."CPC Primary",
+    t.Abstract
+FROM all_assignments AS a
+JOIN patent_text AS t ON a."Patent Number" = t."Patent Number"
+WHERE a.Conveyance = 'ASSIGNMENT OF ASSIGNOR''S INTEREST'
+```
+
+**Note:** Column names with spaces must be wrapped in double quotes.
 
 #### Input Methods
 Enter your query and press:
 - **Mac/Linux:** Ctrl+D
-- **Windows:** Ctrl+Z
+- **Windows:** Ctrl+Z then Enter
 
-Or pipe a query file:
+Or pass a query file as an argument (date-range prompts still apply):
+```bash
+python queries.py myquery.sql
+```
+
+Or pipe a query file (skips **all** prompts and loads every available file):
 ```bash
 python queries.py < myquery.sql
 ```
