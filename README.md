@@ -57,6 +57,32 @@ Note that `assignees.txt` is newline-delimited
 
 The script successfully returns patent assignments in the terminal and as a CSV file: `all_patent_assignments.csv`
 
+#### Extract Patent Abstracts and Field of Invention (`--text`)
+
+Append `--text` to either mode to fetch the **abstract** and **WIPO Field of Invention** (and primary **CPC code**) for each patent, instead of running the assignment pipeline. Results are written to a timestamped Excel file in `patent_text_results/`.
+
+```bash
+# By patent number
+python AssignmentSearch.py bypatentnumber patentnumbers.txt --text
+
+# By assignee — deduplicates patents across all assignees automatically
+python AssignmentSearch.py byassignee assignees.txt --text
+```
+
+Output file: `patent_text_results/patent_text_YYYYMMDD_HHMMSS.xlsx`
+
+| Column | Description |
+|---|---|
+| Patent Number | USPTO patent number |
+| Patent Title | Title of the patent |
+| Abstract | Full patent abstract |
+| WIPO Field of Invention | WIPO IPC technology field (e.g. `Electrical Engineering — Computer technology`) |
+| CPC Primary | Primary CPC classification code (e.g. `G06F30/28`) |
+
+Patent numbers not found as granted patents (e.g. pre-grant publication numbers like `20230XXXXXX`) are automatically retried against the PatentsView pre-grant publications endpoint.
+
+Requires `PATENTSVIEW_API_KEY` to be set (same key used for `byassignee` mode).
+
 **Troubleshooting:**
 - If you notice rate-limiting errors (code: 429), increase `--delay 0.2` to `--delay 0.5` or more
 - If any fail through 404 errors, it will try them at the end again and place successful ones at the end of the CSV file

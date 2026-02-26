@@ -985,6 +985,403 @@ def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None
         page_bar.close()
     return sorted(all_patents)
 
+# -------------------- PATENT TEXT EXTRACTION --------------------
+
+def _pv_post_with_retry(url: str, headers: dict, body: dict, max_retries: int = 3, debug: bool = False):
+    """POST to PatentsView with retry/backoff for 429 and 5xx."""
+    attempt = 0
+    r = None
+    while attempt < max_retries:
+        r = requests.post(url, headers=headers, json=body)
+        if r.status_code == 200:
+            return r
+        if r.status_code == 429:
+            sleep_for = 5
+            try:
+                detail = r.json().get("detail", "")
+                m = re.search(r"(\d+)\s*seconds?", detail)
+                if m:
+                    sleep_for = int(m.group(1)) + 1
+            except Exception:
+                pass
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep_for = int(retry_after)
+                except Exception:
+                    pass
+            if debug:
+                print(f"⚠️  PatentsView 429: sleeping {sleep_for}s before retry")
+            time.sleep(sleep_for)
+            attempt += 1
+            continue
+        if 500 <= r.status_code < 600:
+            backoff = 2 ** attempt
+            if debug:
+                print(f"⚠️  PatentsView {r.status_code}: retrying in {backoff}s")
+            time.sleep(backoff)
+            attempt += 1
+            continue
+        if debug:
+            print(f"❌ PatentsView {r.status_code}: {r.text}")
+        return r
+    return r
+
+
+# Hardcoded WIPO 35-field IPC technology concordance table.
+# wipo_id (trailing path segment from PatentsView URL references) → human-readable text.
+_WIPO_TABLE: Dict[str, str] = {
+    "1":  "Electrical Engineering — Electrical machinery, apparatus, energy",
+    "2":  "Electrical Engineering — Audio-visual technology",
+    "3":  "Electrical Engineering — Telecommunications",
+    "4":  "Electrical Engineering — Digital communication",
+    "5":  "Electrical Engineering — Basic communication processes",
+    "6":  "Electrical Engineering — Computer technology",
+    "7":  "Electrical Engineering — IT methods for management",
+    "8":  "Electrical Engineering — Semiconductors",
+    "9":  "Instruments — Optics",
+    "10": "Instruments — Measurement",
+    "11": "Instruments — Analysis of biological materials",
+    "12": "Instruments — Control",
+    "13": "Instruments — Medical technology",
+    "14": "Chemistry — Organic fine chemistry",
+    "15": "Chemistry — Biotechnology",
+    "16": "Chemistry — Pharmaceuticals",
+    "17": "Chemistry — Macromolecular chemistry, polymers",
+    "18": "Chemistry — Food chemistry",
+    "19": "Chemistry — Basic materials chemistry",
+    "20": "Chemistry — Materials, metallurgy",
+    "21": "Chemistry — Surface technology, coating",
+    "22": "Chemistry — Micro-structural and nano-technology",
+    "23": "Chemistry — Chemical engineering",
+    "24": "Chemistry — Environmental technology",
+    "25": "Mechanical Engineering — Handling",
+    "26": "Mechanical Engineering — Machine tools",
+    "27": "Mechanical Engineering — Engines, pumps, turbines",
+    "28": "Mechanical Engineering — Thermal processes and apparatus",
+    "29": "Mechanical Engineering — Mechanical elements",
+    "30": "Mechanical Engineering — Transport",
+    "31": "Other Fields — Furniture, games",
+    "32": "Other Fields — Other consumer goods",
+    "33": "Other Fields — Civil engineering",
+    "34": "Other Fields — Other special machines",
+    "35": "Other Fields — Agriculture, food processing",
+}
+
+
+def _extract_wipo_text(wipo_list: list) -> str:
+    """Extract human-readable WIPO Field of Invention from a patent's wipo sub-array.
+
+    PatentsView returns wipo_field values as URL references, e.g.
+    'https://search.patentsview.org/api/v1/wipo/10/'.  Strip the trailing ID
+    and look it up in the local concordance table.
+    Sort by wipo_sequence; join multiple distinct fields with ' | '.
+    """
+    if not wipo_list:
+        return ""
+    try:
+        wipo_list = sorted(wipo_list, key=lambda x: x.get("wipo_sequence", 99) if isinstance(x, dict) else 99)
+    except Exception:
+        pass
+    seen: List[str] = []
+    for w in wipo_list:
+        if not isinstance(w, dict):
+            continue
+        # wipo_field is a URL ref like '.../wipo/10/' — strip trailing ID
+        raw = (w.get("wipo_field") or w.get("wipo_field_id") or "").strip().rstrip("/")
+        if not raw:
+            continue
+        wid = raw.rsplit("/", 1)[-1] if raw.startswith("http") else raw
+        label = _WIPO_TABLE.get(wid, f"WIPO field {wid}")
+        if label not in seen:
+            seen.append(label)
+    return " | ".join(seen)
+
+
+def _cpc_group_id_to_code(raw: str) -> str:
+    """Convert a PatentsView cpc_group_id to standard CPC notation.
+
+    PatentsView stores CPC group identifiers with ':' instead of '/', e.g.
+    'G01S7:4863'. Convert to 'G01S7/4863'.  If the value happens to be a
+    URL reference (fallback safety), strip to the path segment first.
+    """
+    v = raw.strip().rstrip("/")
+    if v.startswith("http"):
+        v = v.rsplit("/", 1)[-1]
+    return v.replace(":", "/")
+
+
+def fetch_patent_text_batch(
+    patent_ids: List[str],
+    api_key: str,
+    batch_size: int = 100,
+    delay: float = 0.2,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """Fetch abstract + WIPO Field of Invention for granted patents from PatentsView.
+
+    Strategy:
+    - Request only scalar / _id fields from /api/v1/patent/ so we never receive
+      URL references.  In particular, cpc_group_id returns the plain code string
+      (e.g. "G01S7:4863") whereas cpc_group returns a URL reference.
+    - Fetch WIPO classification separately from /api/v1/wipo/ filtered by
+      patent_id.  That endpoint returns sector_title and field_title as plain
+      scalar strings — no URL references.
+    """
+    pv_url = "https://search.patentsview.org/api/v1/patent/"
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+
+    # Use bare 'wipo' (not dot-notation) so the API nests results under
+    # the 'wipo' key in the response.  With dot-notation the API uses a flat
+    # key like 'wipo.wipo_field', making p.get('wipo') return None.
+    fields = [
+        "patent_id",
+        "patent_title",
+        "patent_abstract",
+        "wipo",
+        "cpc_current.cpc_group_id",
+        "cpc_current.cpc_subclass_id",
+        "cpc_current.cpc_sequence",
+    ]
+
+    rows = []
+    batches = [patent_ids[i: i + batch_size] for i in range(0, len(patent_ids), batch_size)]
+    total_batches = len(batches)
+
+    for b_idx, batch in enumerate(batches, start=1):
+        if debug:
+            print(f"  [patent text] batch {b_idx}/{total_batches} ({len(batch)} ids)")
+
+        body = {
+            "q": {"patent_id": batch},
+            "f": fields,
+            "o": {"size": batch_size, "pad_patent_id": False},
+        }
+
+        r = _pv_post_with_retry(pv_url, headers, body, debug=debug)
+        if r is None or r.status_code != 200:
+            for pid in batch:
+                rows.append({
+                    "Patent Number": pid,
+                    "Patent Title": "",
+                    "Abstract": "",
+                    "WIPO Field of Invention": "",
+                    "CPC Primary": "",
+                    "Note": f"API error {getattr(r, 'status_code', 'N/A')}",
+                })
+            continue
+
+        data = r.json()
+        found = {p["patent_id"]: p for p in data.get("patents", []) if p.get("patent_id")}
+
+        if debug and data.get("patents"):
+            sample = data["patents"][0]
+            print(f"  [debug] sample patent keys: {list(sample.keys())}")
+            print(f"  [debug] sample wipo raw: {sample.get('wipo')}")
+            print(f"  [debug] sample cpc_current raw: {str(sample.get('cpc_current'))[:300]}")
+
+        for pid in batch:
+            p = found.get(pid)
+            if p is None:
+                rows.append({
+                    "Patent Number": pid,
+                    "Patent Title": "",
+                    "Abstract": "",
+                    "WIPO Field of Invention": "",
+                    "CPC Primary": "",
+                    "Note": "Not found in PatentsView (may be pre-grant)",
+                })
+                continue
+
+            # CPC: sort by sequence, take first group_id code
+            cpc_list = p.get("cpc_current") or []
+            cpc_primary = ""
+            if cpc_list:
+                try:
+                    cpc_list = sorted(cpc_list, key=lambda x: x.get("cpc_sequence", 99) if isinstance(x, dict) else 99)
+                except Exception:
+                    pass
+                for c in cpc_list:
+                    if not isinstance(c, dict):
+                        continue
+                    raw = (c.get("cpc_group_id") or c.get("cpc_subclass_id") or "").strip()
+                    if raw:
+                        cpc_primary = _cpc_group_id_to_code(raw)
+                        break
+
+            rows.append({
+                "Patent Number": pid,
+                "Patent Title": (p.get("patent_title") or "").strip(),
+                "Abstract": (p.get("patent_abstract") or "").strip(),
+                "WIPO Field of Invention": _extract_wipo_text(p.get("wipo") or []),
+                "CPC Primary": cpc_primary,
+                "Note": "",
+            })
+
+        if delay and delay > 0:
+            time.sleep(delay)
+
+    return pd.DataFrame(rows)
+
+
+def fetch_publication_text_batch(
+    doc_numbers: List[str],
+    api_key: str,
+    batch_size: int = 100,
+    delay: float = 0.2,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """Fetch abstract + CPC classification for pre-grant publications from PatentsView.
+
+    Uses /api/v1/publication/ with scalar / _id fields only to avoid URL refs.
+    WIPO classifications are typically only assigned to granted patents, so the
+    WIPO column will be empty for pre-grant publications.
+    """
+    pub_url = "https://search.patentsview.org/api/v1/publication/"
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+
+    fields = [
+        "document_number",
+        "publication_title",
+        "publication_abstract",
+        "wipo",
+        "cpc_current.cpc_group_id",
+        "cpc_current.cpc_subclass_id",
+        "cpc_current.cpc_sequence",
+    ]
+
+    rows = []
+    batches = [doc_numbers[i: i + batch_size] for i in range(0, len(doc_numbers), batch_size)]
+    total_batches = len(batches)
+
+    for b_idx, batch in enumerate(batches, start=1):
+        if debug:
+            print(f"  [publication text] batch {b_idx}/{total_batches} ({len(batch)} doc numbers)")
+
+        body = {
+            "q": {"document_number": batch},
+            "f": fields,
+            "o": {"size": batch_size},
+        }
+
+        r = _pv_post_with_retry(pub_url, headers, body, debug=debug)
+        if r is None or r.status_code != 200:
+            for dn in batch:
+                rows.append({
+                    "Patent Number": dn,
+                    "Patent Title": "",
+                    "Abstract": "",
+                    "WIPO Field of Invention": "",
+                    "CPC Primary": "",
+                    "Note": f"Publication API error {getattr(r, 'status_code', 'N/A')}",
+                })
+            continue
+
+        data = r.json()
+        found = {p["document_number"]: p for p in data.get("publications", []) if p.get("document_number")}
+
+        for dn in batch:
+            p = found.get(dn)
+            if p is None:
+                rows.append({
+                    "Patent Number": dn,
+                    "Patent Title": "",
+                    "Abstract": "",
+                    "WIPO Field of Invention": "",
+                    "CPC Primary": "",
+                    "Note": "Not found in PatentsView publications",
+                })
+                continue
+
+            cpc_list = p.get("cpc_current") or []
+            cpc_primary = ""
+            if cpc_list:
+                try:
+                    cpc_list = sorted(cpc_list, key=lambda x: x.get("cpc_sequence", 99) if isinstance(x, dict) else 99)
+                except Exception:
+                    pass
+                for c in cpc_list:
+                    if not isinstance(c, dict):
+                        continue
+                    raw = (c.get("cpc_group_id") or c.get("cpc_subclass_id") or "").strip()
+                    if raw:
+                        cpc_primary = _cpc_group_id_to_code(raw)
+                        break
+
+            rows.append({
+                "Patent Number": dn,
+                "Patent Title": (p.get("publication_title") or "").strip(),
+                "Abstract": (p.get("publication_abstract") or "").strip(),
+                "WIPO Field of Invention": _extract_wipo_text(p.get("wipo") or []),
+                "CPC Primary": cpc_primary,
+                "Note": "",
+            })
+
+        if delay and delay > 0:
+            time.sleep(delay)
+
+    return pd.DataFrame(rows)
+
+
+def run_patent_text_extraction(
+    patent_numbers: List[str],
+    patentsview_key: Optional[str],
+    delay: float = 0.2,
+    debug: bool = False,
+    out_prefix: str = "patent_text",
+) -> None:
+    """Fetch abstract + WIPO Field of Invention for each patent and write an Excel file.
+
+    Patents not found in the granted-patent endpoint are retried against the
+    pre-grant publication endpoint (useful when patent_numbers includes
+    publication doc numbers like 20230XXXXXX).
+    """
+    api_key = patentsview_key or PATENTSVIEW_API_KEY
+    if not api_key:
+        print("Error: PatentsView API key required for patent text extraction. "
+              "Set PATENTSVIEW_API_KEY or pass --patentsview-key.")
+        sys.exit(2)
+
+    print(f"\n📄 Patent text extraction: {len(patent_numbers)} unique patent(s)")
+
+    # First pass: try all as granted patents
+    df = fetch_patent_text_batch(patent_numbers, api_key, delay=delay, debug=debug)
+
+    # Identify any that were not found in the granted patent endpoint
+    not_found_mask = df["Note"].str.contains("pre-grant|Not found", na=False)
+    not_found_ids = df.loc[not_found_mask, "Patent Number"].tolist()
+
+    if not_found_ids:
+        print(f"  {len(not_found_ids)} patent(s) not found as granted — retrying as pre-grant publications...")
+        pub_df = fetch_publication_text_batch(not_found_ids, api_key, delay=delay, debug=debug)
+
+        # Merge: replace the not-found rows with publication results
+        df = df[~not_found_mask].copy()
+        df = pd.concat([df, pub_df], ignore_index=True)
+
+    # Sort by Patent Number for clean output
+    df = df.sort_values("Patent Number").reset_index(drop=True)
+
+    # Drop the Note column if it's entirely empty (clean run)
+    if df["Note"].str.strip().eq("").all():
+        df = df.drop(columns=["Note"])
+
+    # Write Excel output
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = "patent_text_results"
+    os.makedirs(out_dir, exist_ok=True)
+    xlsx_path = os.path.join(out_dir, f"{out_prefix}_{ts}.xlsx")
+
+    try:
+        df.to_excel(xlsx_path, index=False, engine="openpyxl")
+        print(f"✅ Saved patent text results: {xlsx_path}  ({len(df)} patents)")
+    except ImportError:
+        csv_path = xlsx_path.replace(".xlsx", ".csv")
+        df.to_csv(csv_path, index=False)
+        print(f"✅ Saved patent text results (CSV fallback): {csv_path}  ({len(df)} patents)")
+
+
 # -------------------- MAIN --------------------
 
 def main():
@@ -997,6 +1394,16 @@ def main():
     parser.add_argument("--per-page", type=int, default=100, help="Number of patents to request per page from PatentsView (default: 100)")
     parser.add_argument("--max-pages", type=int, default=10, help="Maximum number of pages to request (default: 10)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output for PatentsView pagination")
+    parser.add_argument(
+        "--text",
+        action="store_true",
+        help=(
+            "Extract patent abstract and WIPO Field of Invention per patent and save "
+            "to an Excel file in patent_text_results/. Uses PatentsView. "
+            "When combined with byassignee mode, the distinct set of patents across "
+            "all assignees is used. Skips the USPTO assignment pipeline."
+        ),
+    )
     args = parser.parse_args()
 
     if args.inputtype == "bypatentnumber":
@@ -1008,6 +1415,19 @@ def main():
             patent_numbers.extend(search_patents_by_assignee(a, api_key=args.patentsview_key, per_page=args.per_page, max_pages=args.max_pages, debug=args.debug))
 
     patent_numbers = sorted(set(patent_numbers))
+
+    # --text mode: extract abstract + WIPO Field of Invention then exit
+    if args.text:
+        if not patent_numbers:
+            print("No patent numbers found.")
+            sys.exit(1)
+        run_patent_text_extraction(
+            patent_numbers,
+            patentsview_key=args.patentsview_key,
+            delay=args.delay,
+            debug=args.debug,
+        )
+        return
     if not patent_numbers:
         print("No patent numbers found.")
         sys.exit(1)

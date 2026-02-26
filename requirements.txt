@@ -3,3 +3,4 @@ pandasql>=0.7.3
 openpyxl>=3.0.0
 requests>=2.28.0
 python-dotenv>=1.0.0
+tqdm>=4.60.0
