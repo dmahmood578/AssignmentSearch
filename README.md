@@ -1,5 +1,7 @@
 # Patent Assignment Search Tool
 
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm_NC-blue.svg)](LICENSE)
+
 ## Setup
 
 ### 1. Get API Keys
@@ -195,3 +197,7 @@ python queries.py < myquery.sql
 Results are saved in the `query_results/` folder with timestamps:
 - `query_results/query_results_YYYYMMDD_HHMMSS.csv`
 - `query_results/query_results_YYYYMMDD_HHMMSS.xlsx`
+
+## License
+
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Free for personal, academic, and non-commercial use. Commercial use requires separate written permission from the author.
