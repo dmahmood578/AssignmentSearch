@@ -1613,6 +1613,7 @@ def run_patent_text_extraction(
     delay: float = 0.2,
     debug: bool = False,
     out_prefix: str = "patent_text",
+    claims_source: str = "auto",
 ) -> None:
     """Fetch patent text summary plus detailed claims and write timestamped files.
 
@@ -1647,13 +1648,37 @@ def run_patent_text_extraction(
     claim_frames = []
     claim_errors: List[str] = []
 
-    if granted_ids:
-        granted_claims, granted_errors = fetch_granted_claims_batch(granted_ids, api_key, delay=delay, debug=debug)
-        claim_errors.extend(granted_errors)
-        if not granted_claims.empty:
-            claim_frames.append(granted_claims)
+    use_patentsview_claims = claims_source in ("auto", "patentsview")
+    use_google_fallback = claims_source in ("auto", "google")
 
-    if not_found_ids:
+    if use_patentsview_claims and granted_ids:
+        if claims_source == "auto" and len(granted_ids) > 30:
+            probe_ids = granted_ids[:30]
+            probe_claims, probe_errors = fetch_granted_claims_batch(probe_ids, api_key, delay=delay, debug=debug)
+            claim_errors.extend(probe_errors)
+            probe_coverage = (len(set(probe_claims["Patent Number"])) / len(probe_ids)) if not probe_claims.empty else 0.0
+            if probe_coverage < 0.1:
+                print(
+                    f"  PatentsView claims probe coverage {probe_coverage:.0%} on first {len(probe_ids)} patents; "
+                    "skipping remaining PatentsView claims and using Google fallback."
+                )
+                use_patentsview_claims = False
+            else:
+                if not probe_claims.empty:
+                    claim_frames.append(probe_claims)
+                remaining_ids = granted_ids[len(probe_ids):]
+                if remaining_ids:
+                    remaining_claims, remaining_errors = fetch_granted_claims_batch(remaining_ids, api_key, delay=delay, debug=debug)
+                    claim_errors.extend(remaining_errors)
+                    if not remaining_claims.empty:
+                        claim_frames.append(remaining_claims)
+        else:
+            granted_claims, granted_errors = fetch_granted_claims_batch(granted_ids, api_key, delay=delay, debug=debug)
+            claim_errors.extend(granted_errors)
+            if not granted_claims.empty:
+                claim_frames.append(granted_claims)
+
+    if use_patentsview_claims and not_found_ids:
         publication_claims, publication_errors = fetch_publication_claims_batch(not_found_ids, api_key, delay=delay, debug=debug)
         claim_errors.extend(publication_errors)
         if not publication_claims.empty:
@@ -1665,16 +1690,18 @@ def run_patent_text_extraction(
 
     # Fallback source: Google Patents HTML claims for granted patents when
     # PatentsView claims endpoint returns no rows or partial coverage.
-    covered_ids = set(claims_df["Patent Number"].astype(str).tolist()) if not claims_df.empty else set()
-    missing_granted_ids = [pid for pid in granted_ids if pid not in covered_ids]
-    if missing_granted_ids:
-        print(f"  {len(missing_granted_ids)} granted patent(s) missing claims from PatentsView — trying Google Patents fallback...")
-        google_claims_df = fetch_google_patent_claims_batch(missing_granted_ids, delay=delay, debug=debug)
-        if not google_claims_df.empty:
-            print(f"  ✓ Google Patents fallback returned {len(google_claims_df)} claim row(s)")
-            claims_df = pd.concat([claims_df, google_claims_df], ignore_index=True) if not claims_df.empty else google_claims_df
-        else:
-            claim_errors.append("Google Patents fallback returned no claim rows")
+    if use_google_fallback:
+        covered_ids = set(claims_df["Patent Number"].astype(str).tolist()) if not claims_df.empty else set()
+        missing_granted_ids = [pid for pid in granted_ids if pid not in covered_ids]
+        if missing_granted_ids:
+            source_note = "PatentsView" if use_patentsview_claims else "selected source"
+            print(f"  {len(missing_granted_ids)} granted patent(s) missing claims from {source_note} — trying Google Patents fallback...")
+            google_claims_df = fetch_google_patent_claims_batch(missing_granted_ids, delay=delay, debug=debug)
+            if not google_claims_df.empty:
+                print(f"  ✓ Google Patents fallback returned {len(google_claims_df)} claim row(s)")
+                claims_df = pd.concat([claims_df, google_claims_df], ignore_index=True) if not claims_df.empty else google_claims_df
+            else:
+                claim_errors.append("Google Patents fallback returned no claim rows")
 
     if not claims_df.empty:
         claim_summary = _build_claim_summary(claims_df)
@@ -1749,6 +1776,16 @@ def main():
     parser.add_argument("--max-pages", type=int, default=10, help="Maximum number of pages to request (default: 10)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output for PatentsView pagination")
     parser.add_argument(
+        "--claims-source",
+        choices=["auto", "patentsview", "google"],
+        default="auto",
+        help=(
+            "Claims source strategy for --text mode: "
+            "auto (probe PatentsView and skip when coverage is low), "
+            "patentsview (PatentsView only), or google (Google Patents only)."
+        ),
+    )
+    parser.add_argument(
         "--text",
         action="store_true",
         help=(
@@ -1781,6 +1818,7 @@ def main():
             patentsview_key=args.patentsview_key,
             delay=args.delay,
             debug=args.debug,
+            claims_source=args.claims_source,
         )
         return
     if not patent_numbers:

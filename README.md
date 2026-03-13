@@ -71,6 +71,16 @@ python AssignmentSearch.py bypatentnumber patentnumbers.txt --text
 
 # By assignee — deduplicates patents across all assignees automatically
 python AssignmentSearch.py byassignee assignees.txt --text
+
+# Claims source strategy (optional)
+# auto (default): probe PatentsView; if low claim coverage, skip to Google fallback
+python AssignmentSearch.py byassignee assignees.txt --text --claims-source auto
+
+# Use Google claims only (fastest when PatentsView claims are mostly empty)
+python AssignmentSearch.py byassignee assignees.txt --text --claims-source google
+
+# Use PatentsView claims only (no Google fallback)
+python AssignmentSearch.py byassignee assignees.txt --text --claims-source patentsview
 ```
 
 Output files:
