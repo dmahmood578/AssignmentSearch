@@ -63,7 +63,7 @@ The script returns patent assignments as timestamped CSV and XLSX files in `assi
 
 #### Extract Patent Abstracts and Field of Invention (`--text`)
 
-Append `--text` to either mode to fetch the **abstract** and **WIPO Field of Invention** (and primary **CPC code**) for each patent, instead of running the assignment pipeline. Results are written to a timestamped Excel file in `patent_text_results/`.
+Append `--text` to either mode to fetch the **abstract**, **WIPO Field of Invention**, primary **CPC code**, and claim summary for each patent, instead of running the assignment pipeline. Results are written to timestamped Excel files in `patent_text_results/` and `patent_claims_results/`.
 
 ```bash
 # By patent number
@@ -73,7 +73,9 @@ python AssignmentSearch.py bypatentnumber patentnumbers.txt --text
 python AssignmentSearch.py byassignee assignees.txt --text
 ```
 
-Output file: `patent_text_results/patent_text_YYYYMMDD_HHMMSS.xlsx`
+Output files:
+- `patent_text_results/patent_text_YYYYMMDD_HHMMSS.xlsx`
+- `patent_claims_results/patent_claims_YYYYMMDD_HHMMSS.xlsx`
 
 | Column | Description |
 |---|---|
@@ -82,6 +84,20 @@ Output file: `patent_text_results/patent_text_YYYYMMDD_HHMMSS.xlsx`
 | Abstract | Full patent abstract |
 | WIPO Field of Invention | WIPO IPC technology field (e.g. `Electrical Engineering — Computer technology`) |
 | CPC Primary | Primary CPC classification code (e.g. `G06F30/28`) |
+| Claim Count | Number of claims returned for the patent, when PatentsView claims data is available |
+| Claim 1 | The first claim text, for quick summary filtering, when claim text is available |
+
+Detailed claim-level output is written separately with one row per claim:
+
+| Column | Description |
+|---|---|
+| Patent Number | USPTO patent number or publication number |
+| Claim Number | Display claim number from PatentsView |
+| Claim Sequence | Claim ordering sequence |
+| Claim Text | Full text of the claim |
+| Is Dependent | `Yes` if the claim is dependent, `No` if not |
+
+If PatentsView returns no claim rows for the current environment, the main `patent_text` export is still saved and the claim columns are left blank.
 
 Patent numbers not found as granted patents (e.g. pre-grant publication numbers like `20230XXXXXX`) are automatically retried against the PatentsView pre-grant publications endpoint.
 
@@ -109,7 +125,7 @@ python queries.py < myquery.sql
 ```
 
 The tool will:
-1. List all available result files in `assignment_results/` and `patent_text_results/`
+1. List all available result files in `assignment_results/`, `patent_text_results/`, and `patent_claims_results/`
 2. Ask whether to load each table, and for what **date/time range** of run outputs to include
 3. Concatenate all matching files into the selected tables
 4. Show example queries, then prompt for your SQL
@@ -121,6 +137,7 @@ The tool will:
 |---|---|---|
 | `all_assignments` | `assignment_results/` | Running without `--text` |
 | `patent_text` | `patent_text_results/` | Running with `--text` |
+| `patent_claims` | `patent_claims_results/` | Running with `--text` |
 
 #### Date Range Selection
 
@@ -158,21 +175,37 @@ SELECT
     "Patent Title",
     "WIPO Field of Invention",
     "CPC Primary",
+    "Claim Count",
+    "Claim 1",
     Abstract
 FROM patent_text
 WHERE "WIPO Field of Invention" LIKE '%Computer technology%'
 ```
 
-**Join both tables:**
+**Query detailed claims only:**
+```sql
+SELECT
+    "Patent Number",
+    "Claim Number",
+    "Is Dependent",
+    "Claim Text"
+FROM patent_claims
+WHERE "Claim Number" IN ('1', '2', '3')
+```
+
+**Join all three tables:**
 ```sql
 SELECT
     a."Patent Number",
     a.Assignees,
     t."WIPO Field of Invention",
     t."CPC Primary",
-    t.Abstract
+    t."Claim Count",
+    c."Claim Number",
+    c."Claim Text"
 FROM all_assignments AS a
 JOIN patent_text AS t ON a."Patent Number" = t."Patent Number"
+JOIN patent_claims AS c ON a."Patent Number" = c."Patent Number"
 WHERE a.Conveyance = 'ASSIGNMENT OF ASSIGNOR''S INTEREST'
 ```
 

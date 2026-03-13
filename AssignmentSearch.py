@@ -19,6 +19,7 @@ import sys
 import re
 import json
 import time
+import html
 from typing import List, Tuple, Optional, Any, Dict
 try:
     from tqdm import tqdm
@@ -1111,6 +1112,274 @@ def _cpc_group_id_to_code(raw: str) -> str:
     return v.replace(":", "/")
 
 
+def _normalize_claim_text(raw: Any) -> str:
+    return re.sub(r"\s+", " ", str(raw or "")).strip()
+
+
+def _normalize_claim_dependent(raw: Any) -> str:
+    if isinstance(raw, bool):
+        return "Yes" if raw else "No"
+    value = str(raw or "").strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return "Yes"
+    if value in {"0", "false", "f", "no", "n"}:
+        return "No"
+    return str(raw or "").strip()
+
+
+def _fetch_claims_batch(
+    doc_ids: List[str],
+    api_key: str,
+    endpoint_url: str,
+    id_field: str,
+    response_key: str,
+    desc: str,
+    unit: str,
+    batch_size: int = 10,
+    delay: float = 0.2,
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
+    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+    fields = [id_field, "claim_sequence", "claim_number", "claim_text", "claim_dependent"]
+
+    rows = []
+    endpoint_errors: List[str] = []
+    batches = [doc_ids[i: i + batch_size] for i in range(0, len(doc_ids), batch_size)]
+    total_batches = len(batches)
+    bar = tqdm(total=len(doc_ids), desc=desc, unit=unit) if tqdm else None
+
+    for b_idx, batch in enumerate(batches, start=1):
+        page_size = max(1000, min(10000, len(batch) * 250))
+        if len(batch) == 1:
+            q_clause: Dict[str, Any] = {id_field: batch[0]}
+        else:
+            q_clause = {"_or": [{id_field: doc_id} for doc_id in batch]}
+
+        body = {
+            "q": q_clause,
+            "f": fields,
+            "o": {
+                "size": page_size,
+            },
+            "s": [{id_field: "asc"}, {"claim_sequence": "asc"}],
+        }
+        if id_field == "patent_id":
+            body["o"]["pad_patent_id"] = False
+
+        if debug:
+            print(f"  [{desc.lower()}] batch {b_idx}/{total_batches} ({len(batch)} ids)")
+
+        r = _pv_post_with_retry(endpoint_url, headers, body, debug=debug)
+        if r is None or r.status_code != 200:
+            endpoint_errors.append(f"{desc}: API error {getattr(r, 'status_code', 'N/A')}")
+            if debug:
+                print(f"  [debug] claims batch failed with status {getattr(r, 'status_code', 'N/A')}")
+            if bar:
+                bar.update(len(batch))
+            if delay and delay > 0:
+                time.sleep(delay)
+            continue
+
+        data = r.json()
+        if data.get("error"):
+            msg = str(data.get("error")).strip()
+            if msg:
+                endpoint_errors.append(f"{desc}: {msg}")
+                if debug:
+                    print(f"  [debug] {desc} API message: {msg}")
+        items = data.get(response_key, []) or []
+        if not items:
+            # Be tolerant to key shape changes in API responses.
+            for k in ("g_claims", "pg_claims", "claims", "g_claim", "pg_claim"):
+                alt = data.get(k)
+                if isinstance(alt, list) and alt:
+                    items = alt
+                    break
+        if not items:
+            # Last fallback: first list of dict rows that looks claim-like.
+            for v in data.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict) and ("claim_text" in v[0] or "claim_sequence" in v[0]):
+                    items = v
+                    break
+        if debug and len(items) >= page_size:
+            print(f"  [debug] {desc} may be truncated for batch {b_idx}: received {len(items)} rows at size limit {page_size}")
+        if debug and not items:
+            print(f"  [debug] {desc} returned 0 rows for batch {b_idx}; top-level keys: {list(data.keys())}")
+
+        for item in items:
+            patent_number = (item.get(id_field) or "").strip()
+            claim_text = _normalize_claim_text(item.get("claim_text"))
+            if not patent_number or not claim_text:
+                continue
+            rows.append({
+                "Patent Number": patent_number,
+                "Claim Number": str(item.get("claim_number") or "").strip(),
+                "Claim Sequence": str(item.get("claim_sequence") or "").strip(),
+                "Claim Text": claim_text,
+                "Is Dependent": _normalize_claim_dependent(item.get("claim_dependent")),
+            })
+
+        if bar:
+            bar.update(len(batch))
+        if delay and delay > 0:
+            time.sleep(delay)
+
+    if bar:
+        bar.close()
+    # De-duplicate while preserving order.
+    seen = set()
+    unique_errors: List[str] = []
+    for e in endpoint_errors:
+        if e not in seen:
+            seen.add(e)
+            unique_errors.append(e)
+    return pd.DataFrame(rows), unique_errors
+
+
+def fetch_granted_claims_batch(
+    patent_ids: List[str],
+    api_key: str,
+    batch_size: int = 10,
+    delay: float = 0.2,
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
+    return _fetch_claims_batch(
+        patent_ids,
+        api_key,
+        endpoint_url="https://search.patentsview.org/api/v1/g_claim/",
+        id_field="patent_id",
+        response_key="g_claims",
+        desc="Fetching granted claims",
+        unit="patent",
+        batch_size=batch_size,
+        delay=delay,
+        debug=debug,
+    )
+
+
+def fetch_publication_claims_batch(
+    doc_numbers: List[str],
+    api_key: str,
+    batch_size: int = 10,
+    delay: float = 0.2,
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
+    return _fetch_claims_batch(
+        doc_numbers,
+        api_key,
+        endpoint_url="https://search.patentsview.org/api/v1/pg_claim/",
+        id_field="document_number",
+        response_key="pg_claims",
+        desc="Fetching publication claims",
+        unit="pub",
+        batch_size=batch_size,
+        delay=delay,
+        debug=debug,
+    )
+
+
+def _build_claim_summary(claims_df: pd.DataFrame) -> pd.DataFrame:
+    if claims_df.empty:
+        return pd.DataFrame(columns=["Patent Number", "Claim Count", "Claim 1"])
+
+    sortable = claims_df.copy()
+    sortable["_claim_number_sort"] = pd.to_numeric(sortable["Claim Number"], errors="coerce").fillna(10**9)
+    sortable["_claim_sequence_sort"] = pd.to_numeric(sortable["Claim Sequence"], errors="coerce").fillna(10**9)
+    sortable = sortable.sort_values(
+        ["Patent Number", "_claim_number_sort", "_claim_sequence_sort", "Claim Number", "Claim Sequence"]
+    )
+
+    counts = sortable.groupby("Patent Number").size().rename("Claim Count").reset_index()
+    claim_1 = sortable.groupby("Patent Number", sort=False).first().reset_index()[["Patent Number", "Claim Text"]]
+    claim_1 = claim_1.rename(columns={"Claim Text": "Claim 1"})
+    return counts.merge(claim_1, on="Patent Number", how="left")
+
+
+def _html_to_text(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_google_patent_claims_batch(
+    patent_ids: List[str],
+    delay: float = 0.2,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """Fallback claims fetch from Google Patents HTML pages for granted patents."""
+    rows: List[Dict[str, str]] = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+
+    iterator = tqdm(patent_ids, desc="Fallback claims (Google Patents)", unit="patent") if tqdm else patent_ids
+    for pid in iterator:
+        url = f"https://patents.google.com/patent/US{pid}/en"
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code != 200:
+                if debug:
+                    print(f"  [debug] Google claims fetch failed for {pid}: HTTP {r.status_code}")
+                if delay and delay > 0:
+                    time.sleep(delay)
+                continue
+            page = r.text
+            m = re.search(r"<section itemprop=\"claims\"[^>]*>(.*?)</section>", page, flags=re.DOTALL | re.IGNORECASE)
+            if not m:
+                if debug:
+                    print(f"  [debug] Google claims section missing for {pid}")
+                if delay and delay > 0:
+                    time.sleep(delay)
+                continue
+
+            claims_section = m.group(1)
+            claim_starts = list(re.finditer(r"<div id=\"CLM-[^\"]+\"\s+num=\"(?P<num>\d+)\"\s+class=\"claim\">", claims_section))
+            if not claim_starts:
+                if debug:
+                    print(f"  [debug] Google claim blocks missing for {pid}")
+                if delay and delay > 0:
+                    time.sleep(delay)
+                continue
+
+            for idx, start in enumerate(claim_starts):
+                block_start = start.start()
+                block_end = claim_starts[idx + 1].start() if idx + 1 < len(claim_starts) else len(claims_section)
+                block = claims_section[block_start:block_end]
+                # Heuristic: the wrapper just before the claim block includes class claim-dependent for dependent claims.
+                pre = claims_section[max(0, block_start - 180):block_start]
+                is_dependent = "Yes" if "claim-dependent" in pre else "No"
+
+                text_parts = re.findall(r"<div class=\"claim-text\">(.*?)</div>", block, flags=re.DOTALL | re.IGNORECASE)
+                clean_parts = [_html_to_text(t) for t in text_parts if _html_to_text(t)]
+                if not clean_parts:
+                    continue
+
+                claim_text = " ".join(clean_parts).strip()
+                claim_num_raw = start.group("num")
+                claim_num = str(int(claim_num_raw)) if claim_num_raw.isdigit() else claim_num_raw
+                rows.append({
+                    "Patent Number": pid,
+                    "Claim Number": claim_num,
+                    "Claim Sequence": claim_num,
+                    "Claim Text": claim_text,
+                    "Is Dependent": is_dependent,
+                })
+
+            if delay and delay > 0:
+                time.sleep(delay)
+        except Exception as e:
+            if debug:
+                print(f"  [debug] Google claims exception for {pid}: {e}")
+            if delay and delay > 0:
+                time.sleep(delay)
+
+    return pd.DataFrame(rows)
+
+
 def fetch_patent_text_batch(
     patent_ids: List[str],
     api_key: str,
@@ -1281,6 +1550,7 @@ def fetch_publication_text_batch(
                     "Abstract": "",
                     "WIPO Field of Invention": "",
                     "CPC Primary": "",
+                    "Claim Count": 0,
                     "Note": f"Publication API error {getattr(r, 'status_code', 'N/A')}",
                 })
             continue
@@ -1297,6 +1567,7 @@ def fetch_publication_text_batch(
                     "Abstract": "",
                     "WIPO Field of Invention": "",
                     "CPC Primary": "",
+                    "Claim Count": 0,
                     "Note": "Not found in PatentsView publications",
                 })
                 continue
@@ -1322,6 +1593,7 @@ def fetch_publication_text_batch(
                 "Abstract": (p.get("publication_abstract") or "").strip(),
                 "WIPO Field of Invention": _extract_wipo_text(p.get("wipo") or []),
                 "CPC Primary": cpc_primary,
+                "Claim Count": 0,
                 "Note": "",
             })
 
@@ -1342,7 +1614,7 @@ def run_patent_text_extraction(
     debug: bool = False,
     out_prefix: str = "patent_text",
 ) -> None:
-    """Fetch abstract + WIPO Field of Invention for each patent and write an Excel file.
+    """Fetch patent text summary plus detailed claims and write timestamped files.
 
     Patents not found in the granted-patent endpoint are retried against the
     pre-grant publication endpoint (useful when patent_numbers includes
@@ -1371,6 +1643,55 @@ def run_patent_text_extraction(
         df = df[~not_found_mask].copy()
         df = pd.concat([df, pub_df], ignore_index=True)
 
+    granted_ids = sorted(set(patent_numbers) - set(not_found_ids))
+    claim_frames = []
+    claim_errors: List[str] = []
+
+    if granted_ids:
+        granted_claims, granted_errors = fetch_granted_claims_batch(granted_ids, api_key, delay=delay, debug=debug)
+        claim_errors.extend(granted_errors)
+        if not granted_claims.empty:
+            claim_frames.append(granted_claims)
+
+    if not_found_ids:
+        publication_claims, publication_errors = fetch_publication_claims_batch(not_found_ids, api_key, delay=delay, debug=debug)
+        claim_errors.extend(publication_errors)
+        if not publication_claims.empty:
+            claim_frames.append(publication_claims)
+
+    claims_df = pd.concat(claim_frames, ignore_index=True) if claim_frames else pd.DataFrame(
+        columns=["Patent Number", "Claim Number", "Claim Sequence", "Claim Text", "Is Dependent"]
+    )
+
+    # Fallback source: Google Patents HTML claims for granted patents when
+    # PatentsView claims endpoint returns no rows or partial coverage.
+    covered_ids = set(claims_df["Patent Number"].astype(str).tolist()) if not claims_df.empty else set()
+    missing_granted_ids = [pid for pid in granted_ids if pid not in covered_ids]
+    if missing_granted_ids:
+        print(f"  {len(missing_granted_ids)} granted patent(s) missing claims from PatentsView — trying Google Patents fallback...")
+        google_claims_df = fetch_google_patent_claims_batch(missing_granted_ids, delay=delay, debug=debug)
+        if not google_claims_df.empty:
+            print(f"  ✓ Google Patents fallback returned {len(google_claims_df)} claim row(s)")
+            claims_df = pd.concat([claims_df, google_claims_df], ignore_index=True) if not claims_df.empty else google_claims_df
+        else:
+            claim_errors.append("Google Patents fallback returned no claim rows")
+
+    if not claims_df.empty:
+        claim_summary = _build_claim_summary(claims_df)
+        claim_summary = claim_summary.rename(columns={"Claim Count": "Claim Count (Detailed)"})
+        df = df.merge(claim_summary, on="Patent Number", how="left")
+        df["Claim Count"] = df["Claim Count (Detailed)"].fillna(0).astype(int)
+        df = df.drop(columns=["Claim Count (Detailed)"])
+        df["Claim 1"] = df["Claim 1"].fillna("")
+        claims_df["_claim_number_sort"] = pd.to_numeric(claims_df["Claim Number"], errors="coerce").fillna(10**9)
+        claims_df["_claim_sequence_sort"] = pd.to_numeric(claims_df["Claim Sequence"], errors="coerce").fillna(10**9)
+        claims_df = claims_df.sort_values(
+            ["Patent Number", "_claim_number_sort", "_claim_sequence_sort", "Claim Number", "Claim Sequence"]
+        ).drop(columns=["_claim_number_sort", "_claim_sequence_sort"]).reset_index(drop=True)
+    else:
+        df["Claim Count"] = ""
+        df["Claim 1"] = ""
+
     # Sort by Patent Number for clean output
     df = df.sort_values("Patent Number").reset_index(drop=True)
 
@@ -1381,9 +1702,10 @@ def run_patent_text_extraction(
     # Write Excel output
     import datetime
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = "patent_text_results"
-    os.makedirs(out_dir, exist_ok=True)
-    xlsx_path = os.path.join(out_dir, f"{out_prefix}_{ts}.xlsx")
+    text_out_dir = "patent_text_results"
+    claims_out_dir = "patent_claims_results"
+    os.makedirs(text_out_dir, exist_ok=True)
+    xlsx_path = os.path.join(text_out_dir, f"{out_prefix}_{ts}.xlsx")
 
     try:
         df.to_excel(xlsx_path, index=False, engine="openpyxl")
@@ -1392,6 +1714,26 @@ def run_patent_text_extraction(
         csv_path = xlsx_path.replace(".xlsx", ".csv")
         df.to_csv(csv_path, index=False)
         print(f"✅ Saved patent text results (CSV fallback): {csv_path}  ({len(df)} patents)")
+
+    if claims_df.empty:
+        if claim_errors:
+            print("⚠️  Claim text endpoint returned no rows. API message(s):")
+            for msg in claim_errors[:3]:
+                print(f"   - {msg}")
+            if len(claim_errors) > 3:
+                print(f"   - ...and {len(claim_errors) - 3} more")
+        print("ℹ️  No claim rows were returned from PatentsView. The claims endpoint appears to have no data for this environment, so patent_text was saved without detailed claims and Claim Count was left blank.")
+        return
+
+    os.makedirs(claims_out_dir, exist_ok=True)
+    claims_xlsx_path = os.path.join(claims_out_dir, f"patent_claims_{ts}.xlsx")
+    try:
+        claims_df.to_excel(claims_xlsx_path, index=False, engine="openpyxl")
+        print(f"✅ Saved patent claims results: {claims_xlsx_path}  ({len(claims_df)} claims)")
+    except ImportError:
+        claims_csv_path = claims_xlsx_path.replace(".xlsx", ".csv")
+        claims_df.to_csv(claims_csv_path, index=False)
+        print(f"✅ Saved patent claims results (CSV fallback): {claims_csv_path}  ({len(claims_df)} claims)")
 
 
 # -------------------- MAIN --------------------
@@ -1410,8 +1752,8 @@ def main():
         "--text",
         action="store_true",
         help=(
-            "Extract patent abstract and WIPO Field of Invention per patent and save "
-            "to an Excel file in patent_text_results/. Uses PatentsView. "
+            "Extract patent title, abstract, WIPO field, CPC primary, and claim summary per patent, "
+            "plus a separate detailed patent_claims export. Uses PatentsView. "
             "When combined with byassignee mode, the distinct set of patents across "
             "all assignees is used. Skips the USPTO assignment pipeline."
         ),
@@ -1429,7 +1771,7 @@ def main():
 
     patent_numbers = sorted(set(patent_numbers))
 
-    # --text mode: extract abstract + WIPO Field of Invention then exit
+    # --text mode: extract summary text fields plus claim data then exit
     if args.text:
         if not patent_numbers:
             print("No patent numbers found.")

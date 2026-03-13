@@ -1,11 +1,12 @@
 """
-queries.py — Query patent assignment and patent text results.
+queries.py — Query patent assignment, patent text, and patent claims results.
 
 Tables available in SQL:
-  all_assignments  — concatenation of selected files from assignment_results/
-  patent_text      — concatenation of selected files from patent_text_results/
+    all_assignments  — concatenation of selected files from assignment_results/
+    patent_text      — concatenation of selected files from patent_text_results/
+    patent_claims    — concatenation of selected files from patent_claims_results/
 
-You may query one or both tables in a single SQL statement.
+You may query one or more tables in a single SQL statement.
 """
 
 import os
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 # ── Folder names produced by AssignmentSearch.py ──────────────────────────────
 ASSIGNMENT_DIR = "assignment_results"
 PATENT_TEXT_DIR = "patent_text_results"
+PATENT_CLAIMS_DIR = "patent_claims_results"
 
 # Timestamp pattern embedded in filenames: YYYYMMDD_HHMMSS
 _TS_RE = re.compile(r"(\d{8}_\d{6})")
@@ -191,9 +193,20 @@ SELECT
     "Patent Title",
     "WIPO Field of Invention",
     "CPC Primary",
+    "Claim Count",
+    "Claim 1",
     Abstract
 FROM patent_text
 WHERE "WIPO Field of Invention" LIKE '%Computer technology%'"""
+
+_EXAMPLE_PATENT_CLAIMS = """\
+SELECT
+    "Patent Number",
+    "Claim Number",
+    "Is Dependent",
+    "Claim Text"
+FROM patent_claims
+WHERE "Claim Number" IN ('1', '2', '3')"""
 
 _EXAMPLE_JOIN = """\
 SELECT
@@ -201,15 +214,19 @@ SELECT
     a.Assignees,
     t."WIPO Field of Invention",
     t."CPC Primary",
-    t.Abstract
+    t."Claim Count",
+    c."Claim Number",
+    c."Claim Text"
 FROM all_assignments AS a
 JOIN patent_text AS t ON a."Patent Number" = t."Patent Number"
+JOIN patent_claims AS c ON a."Patent Number" = c."Patent Number"
 WHERE a.Conveyance = 'ASSIGNMENT OF ASSIGNOR''S INTEREST'"""
 
 
 def _print_examples(tables: Dict[str, pd.DataFrame]) -> None:
     has_a = "all_assignments" in tables
     has_t = "patent_text" in tables
+    has_c = "patent_claims" in tables
     print("\n" + "=" * 80)
     print("EXAMPLE QUERIES")
     print("=" * 80)
@@ -219,8 +236,11 @@ def _print_examples(tables: Dict[str, pd.DataFrame]) -> None:
     if has_t:
         print("\n— Query patent_text —")
         print(_EXAMPLE_PATENT_TEXT)
-    if has_a and has_t:
-        print("\n— Join both tables —")
+    if has_c:
+        print("\n— Query patent_claims —")
+        print(_EXAMPLE_PATENT_CLAIMS)
+    if has_a and has_t and has_c:
+        print("\n— Join all three tables —")
         print(_EXAMPLE_JOIN)
     print("\n" + "=" * 80 + "\n")
 
@@ -229,7 +249,7 @@ def _print_examples(tables: Dict[str, pd.DataFrame]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Query patent assignment and patent text results.",
+        description="Query patent assignment, patent text, and patent claims results.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python queries.py\n"
@@ -266,12 +286,14 @@ def main() -> None:
     # 1. Show available files
     a_files = _list_result_files(ASSIGNMENT_DIR)
     t_files = _list_result_files(PATENT_TEXT_DIR)
+    c_files = _list_result_files(PATENT_CLAIMS_DIR)
 
     print("\nAvailable result files:")
     _show_files(ASSIGNMENT_DIR, a_files)
     _show_files(PATENT_TEXT_DIR, t_files)
+    _show_files(PATENT_CLAIMS_DIR, c_files)
 
-    if not a_files and not t_files:
+    if not a_files and not t_files and not c_files:
         print("\nNo result files found. Run AssignmentSearch.py first.")
         sys.exit(1)
 
@@ -304,6 +326,19 @@ def main() -> None:
                 df_t = None
         if df_t is not None:
             tables["patent_text"] = df_t
+
+    if c_files:
+        if is_piped:
+            df_c = _load_table(PATENT_CLAIMS_DIR, "patent_claims", None, None)
+        else:
+            ans = input(f"\nLoad patent_claims_results files into \"patent_claims\"? [Y/n]: ").strip().lower()
+            if ans not in ("n", "no"):
+                c_start, c_end = _ask_range("patent_claims_results")
+                df_c = _load_table(PATENT_CLAIMS_DIR, "patent_claims", c_start, c_end)
+            else:
+                df_c = None
+        if df_c is not None:
+            tables["patent_claims"] = df_c
 
     if not tables:
         print("\nNo data loaded. Exiting.")
