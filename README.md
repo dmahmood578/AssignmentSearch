@@ -5,7 +5,7 @@
 ## Setup
 
 ### 1. Get API Keys
-- Create a USPTO API KEY [How to get your Open Data Portal API Key](https://developer.uspto.gov/api-catalog/how-get-your-open-data-portal-api-key)
+- Create a USPTO Open Data Portal API key [How to get your Open Data Portal API Key](https://developer.uspto.gov/api-catalog/how-get-your-open-data-portal-api-key)
 
 ### 2. Download and Navigate to Project
 - Download the patentsearch folder
@@ -38,7 +38,6 @@ source patentsearch-venv/bin/activate
 In the terminal, enter (spacing matters):
 ```bash
 export USPTO_API_KEY=your_key_here 
-export PATENTSVIEW_API_KEY=your_key_here
 ```
 
 ## Usage
@@ -63,7 +62,7 @@ The script returns patent assignments as timestamped CSV and XLSX files in `assi
 
 #### Extract Patent Abstracts and Field of Invention (`--text`)
 
-Append `--text` to either mode to fetch the **abstract**, **WIPO Field of Invention**, primary **CPC code**, and claim summary for each patent, instead of running the assignment pipeline. Results are written to timestamped Excel files in `patent_text_results/` and `patent_claims_results/`.
+Append `--text` to either mode to fetch the **abstract**, **Technology Field** (a CPC-derived substitute for the old WIPO field), primary **CPC code**, and claim summary for each patent, instead of running the assignment pipeline. Results are written to timestamped Excel files in `patent_text_results/` and `patent_claims_results/`.
 
 ```bash
 # By patent number
@@ -73,14 +72,14 @@ python AssignmentSearch.py bypatentnumber patentnumbers.txt --text
 python AssignmentSearch.py byassignee assignees.txt --text
 
 # Claims source strategy (optional)
-# auto (default): probe PatentsView; if low claim coverage, skip to Google fallback
+# auto (default): probe ODP; if low claim coverage, skip to Google fallback
 python AssignmentSearch.py byassignee assignees.txt --text --claims-source auto
 
-# Use Google claims only (fastest when PatentsView claims are mostly empty)
+# Use Google claims only (fastest when ODP XML claims are mostly empty)
 python AssignmentSearch.py byassignee assignees.txt --text --claims-source google
 
-# Use PatentsView claims only (no Google fallback)
-python AssignmentSearch.py byassignee assignees.txt --text --claims-source patentsview
+# Use ODP claims only (no Google fallback)
+python AssignmentSearch.py byassignee assignees.txt --text --claims-source odp
 ```
 
 Output files:
@@ -92,9 +91,9 @@ Output files:
 | Patent Number | USPTO patent number |
 | Patent Title | Title of the patent |
 | Abstract | Full patent abstract |
-| WIPO Field of Invention | WIPO IPC technology field (e.g. `Electrical Engineering — Computer technology`) |
+| Technology Field | CPC-derived technology field label (e.g. `Electrical Engineering — Computer technology`) |
 | CPC Primary | Primary CPC classification code (e.g. `G06F30/28`) |
-| Claim Count | Number of claims returned for the patent, when PatentsView claims data is available |
+| Claim Count | Number of claims returned for the patent, when ODP claims XML is available |
 | Claim 1 | The first claim text, for quick summary filtering, when claim text is available |
 
 Detailed claim-level output is written separately with one row per claim:
@@ -102,16 +101,18 @@ Detailed claim-level output is written separately with one row per claim:
 | Column | Description |
 |---|---|
 | Patent Number | USPTO patent number or publication number |
-| Claim Number | Display claim number from PatentsView |
+| Claim Number | Display claim number from ODP claims XML |
 | Claim Sequence | Claim ordering sequence |
 | Claim Text | Full text of the claim |
 | Is Dependent | `Yes` if the claim is dependent, `No` if not |
 
-If PatentsView returns no claim rows for the current environment, the main `patent_text` export is still saved and the claim columns are left blank.
+If ODP returns no claim rows for the current environment, the main `patent_text` export is still saved and the claim columns are left blank.
 
-Patent numbers not found as granted patents (e.g. pre-grant publication numbers like `20230XXXXXX`) are automatically retried against the PatentsView pre-grant publications endpoint.
+If USPTO later reintroduces the PatentsView WIPO function on ODP, switch back to that direct source then.
 
-Requires `PATENTSVIEW_API_KEY` to be set (same key used for `byassignee` mode).
+Patent numbers not found as granted patents (e.g. pre-grant publication numbers like `20230XXXXXX`) are automatically retried against the ODP publication wrapper lookup.
+
+Requires `USPTO_API_KEY` to be set.
 
 **Troubleshooting:**
 - If you notice rate-limiting errors (code: 429), increase `--delay 0.2` to `--delay 0.5` or more
@@ -183,13 +184,13 @@ WHERE
 SELECT
     "Patent Number",
     "Patent Title",
-    "WIPO Field of Invention",
+    "Technology Field",
     "CPC Primary",
     "Claim Count",
     "Claim 1",
     Abstract
 FROM patent_text
-WHERE "WIPO Field of Invention" LIKE '%Computer technology%'
+WHERE "Technology Field" LIKE '%Computer technology%'
 ```
 
 **Query detailed claims only:**
@@ -208,7 +209,7 @@ WHERE "Claim Number" IN ('1', '2', '3')
 SELECT
     a."Patent Number",
     a.Assignees,
-    t."WIPO Field of Invention",
+    t."Technology Field",
     t."CPC Primary",
     t."Claim Count",
     c."Claim Number",
