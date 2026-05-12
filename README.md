@@ -88,11 +88,14 @@ Output files:
 
 | Column | Description |
 |---|---|
-| Patent Number | USPTO patent number |
+| Patent Number | Resolved USPTO granted patent number when available; otherwise the input/publication identifier |
+| Input Identifier | Original identifier passed to the script for this row |
+| Identifier | Best available ODP identifier for the record (patent, application, or publication number) |
+| Identifier Type | Label for `Identifier`: `Patent Number`, `Application Number`, `Publication Number`, or `Input Identifier` |
 | Patent Title | Title of the patent |
 | Abstract | Full patent abstract |
-| Technology Field | CPC-derived technology field label (e.g. `Electrical Engineering — Computer technology`) |
-| CPC Primary | Primary CPC classification code (e.g. `G06F30/28`) |
+| Technology Field | CPC-derived technology field label (e.g. `Electrical Engineering — Computer technology`); falls back to `Unmapped CPC (...)` or `Unavailable (no CPC in ODP)` when ODP lacks a mapped CPC |
+| CPC Primary | Primary CPC classification code (e.g. `G06F30/28`); falls back to `Not available in ODP` when absent |
 | Claim Count | Number of claims returned for the patent, when ODP claims XML is available |
 | Claim 1 | The first claim text, for quick summary filtering, when claim text is available |
 
@@ -100,7 +103,10 @@ Detailed claim-level output is written separately with one row per claim:
 
 | Column | Description |
 |---|---|
-| Patent Number | USPTO patent number or publication number |
+| Patent Number | Resolved USPTO granted patent number when available; otherwise the input/publication identifier |
+| Input Identifier | Original identifier passed to the script for this claim row |
+| Identifier | Best available ODP identifier for the claim row's source record |
+| Identifier Type | Label for `Identifier`: `Patent Number`, `Application Number`, `Publication Number`, or `Input Identifier` |
 | Claim Number | Display claim number from ODP claims XML |
 | Claim Sequence | Claim ordering sequence |
 | Claim Text | Full text of the claim |
@@ -115,8 +121,12 @@ Patent numbers not found as granted patents (e.g. pre-grant publication numbers 
 Requires `USPTO_API_KEY` to be set.
 
 **Troubleshooting:**
-- If you notice rate-limiting errors (code: 429), increase `--delay 0.2` to `--delay 0.5` or more
-- If any fail through 404 errors, it will try them at the end again and place successful ones at the end of the CSV file
+- If assignee mode returns zero rows unexpectedly, verify `USPTO_API_KEY` is exported in the same shell session and rerun with `--debug`.
+- If ODP returns `413 Payload Too Large`, reduce `--per-page` (for example `--per-page 20`); the script also adapts page size automatically.
+- If you query by publication/application identifier, output preserves that value in `Input Identifier` while canonical joins use `Patent Number`.
+- `Technology Field = Unavailable (no CPC in ODP)` or `Unmapped CPC (...)` indicates source-data coverage limits, not a silent extraction failure.
+- If ODP claims are sparse, use `--claims-source auto` (default) to allow Google Patents fallback for missing granted claims.
+- If assignment rows fail with `404`, ensure you are on the latest script; assignee mode now filters to granted patent numbers for assignment runs.
 
 ### queries.py - Query and Filter Patent Data
 
@@ -183,6 +193,9 @@ WHERE
 ```sql
 SELECT
     "Patent Number",
+        "Input Identifier",
+        Identifier,
+        "Identifier Type",
     "Patent Title",
     "Technology Field",
     "CPC Primary",
@@ -191,17 +204,21 @@ SELECT
     Abstract
 FROM patent_text
 WHERE "Technology Field" LIKE '%Computer technology%'
+    AND "Technology Field" NOT LIKE 'Unavailable%'
 ```
 
 **Query detailed claims only:**
 ```sql
 SELECT
     "Patent Number",
+    "Input Identifier",
+    Identifier,
+    "Identifier Type",
     "Claim Number",
     "Is Dependent",
     "Claim Text"
 FROM patent_claims
-WHERE "Claim Number" IN ('1', '2', '3')
+WHERE CAST("Claim Number" AS INTEGER) IN (1, 2, 3)
 ```
 
 **Join all three tables:**
@@ -209,6 +226,9 @@ WHERE "Claim Number" IN ('1', '2', '3')
 SELECT
     a."Patent Number",
     a.Assignees,
+    t."Input Identifier",
+    t.Identifier,
+    t."Identifier Type",
     t."Technology Field",
     t."CPC Primary",
     t."Claim Count",

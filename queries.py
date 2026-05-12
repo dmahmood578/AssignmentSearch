@@ -190,29 +190,39 @@ WHERE
 _EXAMPLE_PATENT_TEXT = """\
 SELECT
     "Patent Number",
+        "Input Identifier",
+        Identifier,
+        "Identifier Type",
     "Patent Title",
-    "WIPO Field of Invention",
+        "Technology Field",
     "CPC Primary",
     "Claim Count",
     "Claim 1",
     Abstract
 FROM patent_text
-WHERE "WIPO Field of Invention" LIKE '%Computer technology%'"""
+WHERE "Technology Field" LIKE '%Computer technology%'
+    AND "Technology Field" NOT LIKE 'Unavailable%'"""
 
 _EXAMPLE_PATENT_CLAIMS = """\
 SELECT
     "Patent Number",
+    "Input Identifier",
+    Identifier,
+    "Identifier Type",
     "Claim Number",
     "Is Dependent",
     "Claim Text"
 FROM patent_claims
-WHERE "Claim Number" IN ('1', '2', '3')"""
+WHERE CAST("Claim Number" AS INTEGER) IN (1, 2, 3)"""
 
 _EXAMPLE_JOIN = """\
 SELECT
     a."Patent Number",
     a.Assignees,
-    t."WIPO Field of Invention",
+    t."Input Identifier",
+    t.Identifier,
+    t."Identifier Type",
+    t."Technology Field",
     t."CPC Primary",
     t."Claim Count",
     c."Claim Number",

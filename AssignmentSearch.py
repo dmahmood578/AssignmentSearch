@@ -312,7 +312,7 @@ def _extract_patent_xml_text(xml_text: str) -> Tuple[str, str, List[Dict[str, st
                 if _xml_local_name(child.tag) == "claim-text":
                     claim_text_node = child
                     break
-            claim_text = _xml_text(claim_text_node or node)
+            claim_text = _xml_text(claim_text_node if claim_text_node is not None else node)
             if claim_text:
                 claims.append({
                     "claim_number": claim_number.lstrip("0") or claim_number,
@@ -341,10 +341,16 @@ def _fetch_odp_document_xml(file_url: str, api_key: Optional[str] = None, debug:
 
 def _wrapper_to_text_row(patent_number: str, wrapper: Dict[str, Any], xml_text: str = "") -> Dict[str, str]:
     am = wrapper.get("applicationMetaData", {}) or {}
+    canonical_patent_number = str(am.get("patentNumber") or patent_number or "").strip()
     title = str(am.get("inventionTitle") or "").strip()
     abstract = str(am.get("abstract") or am.get("inventionAbstract") or "").strip()
     claims: List[Dict[str, str]] = []
+    resolved_identifier, resolved_identifier_type = _wrapper_identifier_with_type(wrapper)
     cpc_primary = _extract_cpc_primary(am.get("cpcClassificationBag") or [])
+    cpc_display = cpc_primary or "Not available in ODP"
+    tech_field = _derive_wipo_from_cpc(cpc_primary)
+    if not tech_field:
+        tech_field = f"Unmapped CPC ({cpc_primary})" if cpc_primary else "Unavailable (no CPC in ODP)"
     if xml_text:
         xml_title, xml_abstract, claims = _extract_patent_xml_text(xml_text)
         if xml_title:
@@ -352,11 +358,14 @@ def _wrapper_to_text_row(patent_number: str, wrapper: Dict[str, Any], xml_text: 
         if xml_abstract:
             abstract = xml_abstract
     return {
-        "Patent Number": patent_number,
+        "Patent Number": canonical_patent_number or patent_number,
+        "Input Identifier": patent_number,
+        "Identifier": resolved_identifier or canonical_patent_number or patent_number,
+        "Identifier Type": resolved_identifier_type or "Patent Number",
         "Patent Title": title,
         "Abstract": abstract,
-        "Technology Field": _derive_wipo_from_cpc(cpc_primary),
-        "CPC Primary": cpc_primary,
+        "Technology Field": tech_field,
+        "CPC Primary": cpc_display,
         "_claims_json": json.dumps(claims),
     }
 
@@ -380,6 +389,26 @@ def _find_odp_wrapper(identifier: str, api_key: Optional[str] = None, debug: boo
             return (bags[0] if isinstance(bags[0], dict) else {}, query)
 
     return {}, ""
+
+
+def _wrapper_identifier_with_type(wrapper: Dict[str, Any]) -> Tuple[str, str]:
+    am = wrapper.get("applicationMetaData", {}) or {}
+    candidates = [
+        (am.get("patentNumber"), "Patent Number"),
+        (wrapper.get("applicationNumberText"), "Application Number"),
+        (am.get("applicationNumberText"), "Application Number"),
+        (am.get("earliestPublicationNumber"), "Publication Number"),
+    ]
+    for raw_value, label in candidates:
+        value = str(raw_value or "").strip()
+        if value:
+            return value, label
+    return "", ""
+
+
+def _wrapper_identifier(wrapper: Dict[str, Any]) -> str:
+    identifier, _ = _wrapper_identifier_with_type(wrapper)
+    return identifier
 
 
 def _extract_cpc_primary(cpc_bag: List[Any]) -> str:
@@ -789,18 +818,51 @@ def load_assignees_from_args(inputs: List[str]) -> List[str]:
 # -------------------- ODP ASSIGNEE SEARCH --------------------
 
 
+def _odp_wrapper_search_with_adaptive_limit(
+    query: str,
+    api_key: Optional[str],
+    offset: int,
+    limit: int,
+    debug: bool = False,
+    min_limit: int = 5,
+) -> Tuple[Optional[Any], int]:
+    """Run ODP wrapper search and reduce page size when API returns 413 payload-too-large."""
+    page_limit = max(min_limit, int(limit or min_limit))
+    response = None
+    while page_limit >= min_limit:
+        response = _odp_wrapper_search(query, api_key=api_key, offset=offset, limit=page_limit, debug=debug)
+        if response is not None and response.status_code == 413 and page_limit > min_limit:
+            next_limit = max(min_limit, page_limit // 2)
+            if debug:
+                print(f"⚠️  ODP 413 for limit={page_limit}; retrying with limit={next_limit}")
+            page_limit = next_limit
+            continue
+        break
+    return response, page_limit
+
+
 def get_assignee_ids(assignee_name: str, api_key: Optional[str] = None, debug: bool = False) -> List[str]:
-    """Compatibility helper: return patent numbers that match an assignee name in ODP."""
+    """Compatibility helper: return granted patent numbers that match an assignee name in ODP."""
     api_key = _get_odp_api_key(api_key)
     if not api_key:
         return []
 
-    query = f'assignmentBag.assigneeBag.assigneeNameText:"{assignee_name}"'
+    query = (
+        f'(assignmentBag.assigneeBag.assigneeNameText:"{assignee_name}") '
+        f'AND applicationMetaData.patentNumber:*'
+    )
     patent_numbers: List[str] = []
     seen = set()
     offset = 0
-    while offset < 100:
-        r = _odp_wrapper_search(query, api_key=api_key, offset=offset, limit=100, debug=debug)
+    page_limit = 50
+    while offset < 1000:
+        r, used_limit = _odp_wrapper_search_with_adaptive_limit(
+            query,
+            api_key=api_key,
+            offset=offset,
+            limit=page_limit,
+            debug=debug,
+        )
         if r is None or r.status_code != 200:
             break
         data = r.json()
@@ -811,21 +873,22 @@ def get_assignee_ids(assignee_name: str, api_key: Optional[str] = None, debug: b
             if not isinstance(wrapper, dict):
                 continue
             am = wrapper.get("applicationMetaData", {}) or {}
-            patent_number = str(am.get("patentNumber") or wrapper.get("applicationNumberText") or "").strip()
+            patent_number = str(am.get("patentNumber") or "").strip()
             if patent_number and patent_number not in seen:
                 seen.add(patent_number)
                 patent_numbers.append(patent_number)
-        if len(bags) < 100:
+        page_limit = used_limit
+        if len(bags) < used_limit:
             break
-        offset += 100
+        offset += used_limit
 
     if debug:
         print(f"🔎 ODP assignee lookup found {len(patent_numbers)} patent numbers for '{assignee_name}'")
     return patent_numbers
 
 
-def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None, per_page: int = 100, max_pages: int = 10, debug: bool = False, duplicate_threshold: int = 3) -> List[str]:
-    """Search patents for an assignee using the USPTO ODP wrapper search endpoint."""
+def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None, per_page: int = 50, max_pages: int = 10, debug: bool = False, duplicate_threshold: int = 3) -> List[str]:
+    """Search granted patent numbers for an assignee using the USPTO ODP wrapper search endpoint."""
     api_key = _get_odp_api_key(api_key)
     if not api_key:
         print("Error: USPTO API key not provided. Set USPTO_API_KEY in your environment or pass --odp-key.")
@@ -834,15 +897,28 @@ def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None
     all_patents = set()
     page_bar = tqdm(total=max_pages * 2, desc=f"ODP pages for {assignee_name}", unit="page") if tqdm else None
     queries = [
-        f'assignmentBag.assigneeBag.assigneeNameText:"{assignee_name}"',
-        f'applicationMetaData.firstApplicantName:"{assignee_name}"',
+        (
+            f'(assignmentBag.assigneeBag.assigneeNameText:"{assignee_name}") '
+            f'AND applicationMetaData.patentNumber:*'
+        ),
+        (
+            f'(applicationMetaData.firstApplicantName:"{assignee_name}") '
+            f'AND applicationMetaData.patentNumber:*'
+        ),
     ]
 
     for query in queries:
         offset = 0
         page = 0
+        page_limit = max(5, int(per_page or 50))
         while page < max_pages:
-            r = _odp_wrapper_search(query, api_key=api_key, offset=offset, limit=per_page, debug=debug)
+            r, used_limit = _odp_wrapper_search_with_adaptive_limit(
+                query,
+                api_key=api_key,
+                offset=offset,
+                limit=page_limit,
+                debug=debug,
+            )
             if r is None or r.status_code != 200:
                 break
             data = r.json()
@@ -851,24 +927,31 @@ def search_patents_by_assignee(assignee_name: str, api_key: Optional[str] = None
                 break
 
             added_this_page = 0
+            skipped_non_granted = 0
             for wrapper in bags:
                 if not isinstance(wrapper, dict):
                     continue
                 am = wrapper.get("applicationMetaData", {}) or {}
-                patent_number = str(am.get("patentNumber") or wrapper.get("applicationNumberText") or "").strip()
+                patent_number = str(am.get("patentNumber") or "").strip()
                 if patent_number and patent_number not in all_patents:
                     all_patents.add(patent_number)
                     added_this_page += 1
+                elif not patent_number:
+                    skipped_non_granted += 1
 
             if debug:
-                print(f"🔎 ODP assignee page {page + 1} for '{assignee_name}' returned {len(bags)} records, added {added_this_page}")
+                print(
+                    f"🔎 ODP assignee page {page + 1} for '{assignee_name}' returned {len(bags)} records, "
+                    f"added {added_this_page} granted patents, skipped {skipped_non_granted} non-granted records"
+                )
 
             if page_bar:
                 page_bar.update(1)
 
-            if len(bags) < per_page:
+            page_limit = used_limit
+            if len(bags) < used_limit:
                 break
-            offset += per_page
+            offset += used_limit
             page += 1
 
     if page_bar:
@@ -1146,7 +1229,10 @@ def fetch_granted_claims_batch(
                 if not text:
                     continue
                 rows.append({
-                    "Patent Number": pid,
+                    "Patent Number": str(row.get("Patent Number") or pid),
+                    "Input Identifier": str(row.get("Input Identifier") or pid),
+                    "Identifier": str(row.get("Identifier") or pid),
+                    "Identifier Type": str(row.get("Identifier Type") or "Patent Number"),
                     "Claim Number": str(claim.get("claim_number") or "").strip(),
                     "Claim Sequence": str(claim.get("claim_sequence") or "").strip(),
                     "Claim Text": text,
@@ -1184,7 +1270,10 @@ def fetch_publication_claims_batch(
                 if not text:
                     continue
                 rows.append({
-                    "Patent Number": dn,
+                    "Patent Number": str(row.get("Patent Number") or dn),
+                    "Input Identifier": str(row.get("Input Identifier") or dn),
+                    "Identifier": str(row.get("Identifier") or dn),
+                    "Identifier Type": str(row.get("Identifier Type") or "Publication Number"),
                     "Claim Number": str(claim.get("claim_number") or "").strip(),
                     "Claim Sequence": str(claim.get("claim_sequence") or "").strip(),
                     "Claim Text": text,
@@ -1206,6 +1295,9 @@ def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> D
     if not wrapper:
         return {
             "Patent Number": identifier,
+            "Input Identifier": identifier,
+            "Identifier": identifier,
+            "Identifier Type": "Input Identifier",
             "Patent Title": "",
             "Abstract": "",
             "Technology Field": "",
@@ -1225,6 +1317,33 @@ def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> D
         row["Patent Title"] = str(am.get("inventionTitle") or am.get("publicationTitle") or "").strip()
     if not row.get("Abstract"):
         row["Abstract"] = str(am.get("abstract") or am.get("inventionAbstract") or am.get("publicationAbstract") or "").strip()
+
+    # If core metadata is still missing and we resolved a granted patent number,
+    # refetch by the granted number and backfill from that wrapper's metadata/XML.
+    resolved_patent_number = str(row.get("Patent Number") or "").strip()
+    tech_value = str(row.get("Technology Field") or "").strip()
+    cpc_value = str(row.get("CPC Primary") or "").strip()
+    needs_backfill = any(
+        not str(row.get(field) or "").strip()
+        for field in ("Patent Title", "Abstract")
+    ) or tech_value in {"Unavailable (no CPC in ODP)"} or cpc_value in {"Not available in ODP"} or tech_value.startswith("Unmapped CPC (")
+    if needs_backfill and resolved_patent_number and resolved_patent_number != str(identifier).strip():
+        granted_wrapper, _ = _find_odp_wrapper(resolved_patent_number, api_key=api_key, debug=debug)
+        if granted_wrapper:
+            granted_xml_url = (
+                (granted_wrapper.get("grantDocumentMetaData") or {}).get("fileLocationURI")
+                or (granted_wrapper.get("pgpubDocumentMetaData") or {}).get("fileLocationURI")
+            )
+            granted_xml_text = _fetch_odp_document_xml(granted_xml_url, api_key=api_key, debug=debug) if granted_xml_url else ""
+            granted_row = _wrapper_to_text_row(resolved_patent_number, granted_wrapper, granted_xml_text)
+            if not row.get("Patent Title") and granted_row.get("Patent Title"):
+                row["Patent Title"] = granted_row.get("Patent Title")
+            if not row.get("Abstract") and granted_row.get("Abstract"):
+                row["Abstract"] = granted_row.get("Abstract")
+            if not row.get("Technology Field") and granted_row.get("Technology Field"):
+                row["Technology Field"] = granted_row.get("Technology Field")
+            if not row.get("CPC Primary") and granted_row.get("CPC Primary"):
+                row["CPC Primary"] = granted_row.get("CPC Primary")
     row["Note"] = ""
     row["Source"] = "USPTO ODP"
     return row
@@ -1315,6 +1434,9 @@ def fetch_google_patent_claims_batch(
                 claim_num = str(int(claim_num_raw)) if claim_num_raw.isdigit() else claim_num_raw
                 rows.append({
                     "Patent Number": pid,
+                    "Input Identifier": pid,
+                    "Identifier": pid,
+                    "Identifier Type": "Patent Number",
                     "Claim Number": claim_num,
                     "Claim Sequence": claim_num,
                     "Claim Text": claim_text,
@@ -1457,7 +1579,7 @@ def run_patent_text_extraction(
             claim_frames.append(publication_claims)
 
     claims_df = pd.concat(claim_frames, ignore_index=True) if claim_frames else pd.DataFrame(
-        columns=["Patent Number", "Claim Number", "Claim Sequence", "Claim Text", "Is Dependent"]
+        columns=["Patent Number", "Input Identifier", "Identifier", "Identifier Type", "Claim Number", "Claim Sequence", "Claim Text", "Is Dependent"]
     )
 
     # Fallback source: Google Patents HTML claims for granted patents when
@@ -1544,7 +1666,7 @@ def main():
     parser.add_argument("-o", "--out", default="all_assignments")
     parser.add_argument("--odp-key", dest="odp_key", default=None, help="USPTO ODP X-Api-Key (overrides USPTO_API_KEY env var)")
     parser.add_argument("--delay", type=float, default=0.2, help="Delay in seconds between USPTO requests (helps avoid rate limits). Default: 0.2s")
-    parser.add_argument("--per-page", type=int, default=100, help="Number of patents to request per page from ODP (default: 100)")
+    parser.add_argument("--per-page", type=int, default=50, help="Number of patents to request per page from ODP (default: 50)")
     parser.add_argument("--max-pages", type=int, default=10, help="Maximum number of pages to request (default: 10)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output for ODP pagination")
     parser.add_argument(
