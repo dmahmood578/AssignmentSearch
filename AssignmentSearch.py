@@ -290,11 +290,23 @@ def _xml_text(element: Any) -> str:
     return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
 
 
-def _extract_patent_xml_text(xml_text: str) -> Tuple[str, str, List[Dict[str, str]]]:
-    """Extract title, abstract, and detailed claims from USPTO patent XML."""
+def _extract_patent_xml_text(
+    xml_text: str, source: str = "", debug: bool = False
+) -> Tuple[str, str, List[Dict[str, str]]]:
+    """Extract title, abstract, and detailed claims from USPTO patent XML.
+
+    A malformed/truncated ODP document must not abort the whole batch, so a
+    parse failure degrades to an empty (metadata-only) result.
+    """
     import xml.etree.ElementTree as ET
 
-    root = ET.fromstring(xml_text)
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        print(f"⚠️  Skipping malformed patent XML ({len(xml_text)} bytes, source={source or 'unknown'}): {e}")
+        if debug:
+            print(f"    body[:500]={xml_text[:500]!r}")
+        return "", "", []
     title = ""
     abstract = ""
     claims: List[Dict[str, str]] = []
@@ -324,6 +336,16 @@ def _extract_patent_xml_text(xml_text: str) -> Tuple[str, str, List[Dict[str, st
     return title, abstract, claims
 
 
+def _looks_like_xml(body: str) -> bool:
+    """Reject bodies that clearly are not XML (HTML error/registration pages, JSON, plain text)."""
+    if not body:
+        return False
+    head = body.lstrip()[:200].lower()
+    if head.startswith("<!doctype html") or head.startswith("<html"):
+        return False
+    return head.startswith("<")
+
+
 def _fetch_odp_document_xml(file_url: str, api_key: Optional[str] = None, debug: bool = False) -> str:
     headers = _get_odp_headers(api_key)
     try:
@@ -336,10 +358,24 @@ def _fetch_odp_document_xml(file_url: str, api_key: Optional[str] = None, debug:
         if debug:
             print(f"❌ ODP XML HTTP {r.status_code} for {file_url}: {r.text[:300]}")
         return ""
+    if not _looks_like_xml(r.text):
+        if debug:
+            content_type = r.headers.get("Content-Type") or "unknown"
+            print(
+                f"⚠️  ODP document is not XML (Content-Type={content_type}, {len(r.text)} bytes) "
+                f"for {file_url}: {r.text[:500]!r}"
+            )
+        return ""
     return r.text
 
 
-def _wrapper_to_text_row(patent_number: str, wrapper: Dict[str, Any], xml_text: str = "") -> Dict[str, str]:
+def _wrapper_to_text_row(
+    patent_number: str,
+    wrapper: Dict[str, Any],
+    xml_text: str = "",
+    xml_url: str = "",
+    debug: bool = False,
+) -> Dict[str, str]:
     am = wrapper.get("applicationMetaData", {}) or {}
     canonical_patent_number = str(am.get("patentNumber") or patent_number or "").strip()
     title = str(am.get("inventionTitle") or "").strip()
@@ -352,7 +388,7 @@ def _wrapper_to_text_row(patent_number: str, wrapper: Dict[str, Any], xml_text: 
     if not tech_field:
         tech_field = f"Unmapped CPC ({cpc_primary})" if cpc_primary else "Unavailable (no CPC in ODP)"
     if xml_text:
-        xml_title, xml_abstract, claims = _extract_patent_xml_text(xml_text)
+        xml_title, xml_abstract, claims = _extract_patent_xml_text(xml_text, source=xml_url, debug=debug)
         if xml_title:
             title = xml_title
         if xml_abstract:
@@ -1293,18 +1329,7 @@ def fetch_publication_claims_batch(
 def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> Dict[str, Any]:
     wrapper, _ = _find_odp_wrapper(identifier, api_key=api_key, debug=debug)
     if not wrapper:
-        return {
-            "Patent Number": identifier,
-            "Input Identifier": identifier,
-            "Identifier": identifier,
-            "Identifier Type": "Input Identifier",
-            "Patent Title": "",
-            "Abstract": "",
-            "Technology Field": "",
-            "CPC Primary": "",
-            "Note": "Not found in ODP",
-            "_claims_json": "[]",
-        }
+        return _empty_odp_text_row(identifier, note="Not found in ODP")
 
     am = wrapper.get("applicationMetaData", {}) or {}
     xml_url = (
@@ -1312,7 +1337,7 @@ def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> D
         or (wrapper.get("pgpubDocumentMetaData") or {}).get("fileLocationURI")
     )
     xml_text = _fetch_odp_document_xml(xml_url, api_key=api_key, debug=debug) if xml_url else ""
-    row = _wrapper_to_text_row(identifier, wrapper, xml_text)
+    row = _wrapper_to_text_row(identifier, wrapper, xml_text, xml_url=xml_url, debug=debug)
     if not row.get("Patent Title"):
         row["Patent Title"] = str(am.get("inventionTitle") or am.get("publicationTitle") or "").strip()
     if not row.get("Abstract"):
@@ -1335,7 +1360,10 @@ def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> D
                 or (granted_wrapper.get("pgpubDocumentMetaData") or {}).get("fileLocationURI")
             )
             granted_xml_text = _fetch_odp_document_xml(granted_xml_url, api_key=api_key, debug=debug) if granted_xml_url else ""
-            granted_row = _wrapper_to_text_row(resolved_patent_number, granted_wrapper, granted_xml_text)
+            granted_row = _wrapper_to_text_row(
+                resolved_patent_number, granted_wrapper, granted_xml_text,
+                xml_url=granted_xml_url, debug=debug,
+            )
             if not row.get("Patent Title") and granted_row.get("Patent Title"):
                 row["Patent Title"] = granted_row.get("Patent Title")
             if not row.get("Abstract") and granted_row.get("Abstract"):
@@ -1347,6 +1375,31 @@ def _build_odp_text_row(identifier: str, api_key: str, debug: bool = False) -> D
     row["Note"] = ""
     row["Source"] = "USPTO ODP"
     return row
+
+
+def _empty_odp_text_row(identifier: str, note: str = "") -> Dict[str, Any]:
+    return {
+        "Patent Number": identifier,
+        "Input Identifier": identifier,
+        "Identifier": identifier,
+        "Identifier Type": "Input Identifier",
+        "Patent Title": "",
+        "Abstract": "",
+        "Technology Field": "",
+        "CPC Primary": "",
+        "Note": note,
+        "_claims_json": "[]",
+    }
+
+
+def _build_odp_text_row_safe(identifier: str, api_key: Optional[str], debug: bool = False) -> Dict[str, Any]:
+    """Run _build_odp_text_row without letting one bad document abort the batch."""
+    try:
+        return _build_odp_text_row(identifier, api_key, debug=debug)
+    except Exception as e:
+        if debug:
+            print(f"❌ ODP text row failed for {identifier}: {e}")
+        return _empty_odp_text_row(identifier, note=f"Error: {e}")
 
 
 def _build_claim_summary(claims_df: pd.DataFrame) -> pd.DataFrame:
@@ -1464,7 +1517,7 @@ def fetch_patent_text_batch(
     rows = []
     bar = tqdm(total=len(patent_ids), desc="Fetching patent text", unit="patent") if tqdm else None
     for pid in patent_ids:
-        row = _build_odp_text_row(pid, api_key, debug=debug)
+        row = _build_odp_text_row_safe(pid, api_key, debug=debug)
         row.pop("_claims_json", None)
         rows.append(row)
         if bar:
@@ -1487,7 +1540,7 @@ def fetch_publication_text_batch(
     rows = []
     bar = tqdm(total=len(doc_numbers), desc="Fetching publication text", unit="pub") if tqdm else None
     for dn in doc_numbers:
-        row = _build_odp_text_row(dn, api_key, debug=debug)
+        row = _build_odp_text_row_safe(dn, api_key, debug=debug)
         row["Claim Count"] = 0
         row.pop("_claims_json", None)
         rows.append(row)
